@@ -14,6 +14,10 @@ import prompt from 'prompt';
 
 async function main() {
   prompt.start();
+
+  console.log('Logging in...');
+  const findmy = new FindMy();
+
   const result = await prompt.get({
     properties: {
       username: {
@@ -26,25 +30,20 @@ async function main() {
     },
   });
 
-  console.log('Logging in...');
-  const findmy = new FindMy(
-    result.username,
-    result.password,
-  );
-
-  await findmy.authenticate();
+  await findmy.authenticate(result.username, result.password);
   const devices = await findmy.getDevices();
 
   // For each device print name, battery and location
   console.log('---');
   devices.forEach((device) => {
-    console.log(`Name: ${device.name}`);
-    console.log(`Model: ${device.deviceDisplayName}`);
-    console.log(`Battery: ${device.batteryLevel * 100}%`);
-    if (device.location) {
-      console.log(`Location: ${device.location.latitude}, ${device.location.longitude}`);
+    console.log(`Name: ${device.getName()}`);
+    console.log(`Model: ${device.getModel().exact}`);
+    console.log(`Battery: ${device.getBattery().percentage}%`);
+    const location = device.getLocation();
+    if (location) {
+      console.log(`Location: ${location.lat}, ${location.lon} with accuracy ${location.accuracy}`);
     } else {
-      console.log('Location: Not available');
+      console.log('Location: unknown');
     }
     console.log('---');
   });
