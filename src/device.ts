@@ -5,7 +5,10 @@ import {
 } from './types/findmy.types.js';
 
 export class FindMyDevice {
-  constructor(private findmy: FindMy, private info: iCloudFindMyDeviceInfo) {}
+  constructor(
+    private findmy: FindMy,
+    private info: iCloudFindMyDeviceInfo
+  ) {}
 
   getRawInfo(): iCloudFindMyDeviceInfo {
     return this.info;
@@ -61,14 +64,14 @@ export class FindMyDevice {
           appVersion: '1.0',
           contextApp: 'com.icloud.web.fmf',
         },
-      },
+      }
     )) as iCloudFindMyResponse;
     this.info = result.content[0] ?? this.info;
   }
 
   async sendMessage(
     text: string = 'Hello findmy.js',
-    subject: string = 'Find My iPhone Alert',
+    subject: string = 'Find My iPhone Alert'
   ): Promise<void> {
     const result = (await this.findmy.sendICloudRequest(
       'findme',
@@ -84,7 +87,7 @@ export class FindMyDevice {
         sound: false,
         subject,
         text,
-      },
+      }
     )) as iCloudFindMyResponse;
     this.info = result.content[0] ?? this.info;
   }
@@ -105,7 +108,7 @@ export class FindMyDevice {
         text: message,
         trackingEnabled: true,
         userText: true,
-      },
+      }
     )) as iCloudFindMyResponse;
     this.info = result.content[0] ?? this.info;
   }
@@ -124,7 +127,7 @@ export class FindMyDevice {
         emailUpdates: false,
         trackingEnabled: false,
         userText: false,
-      },
+      }
     )) as iCloudFindMyResponse;
     this.info = result.content[0] ?? this.info;
   }

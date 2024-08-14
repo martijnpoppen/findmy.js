@@ -6,9 +6,7 @@ import {
   AuthenticateFindMy,
 } from './findmy-authentication.js';
 import { iCloudAccountInfo } from './types/account.types.js';
-import {
-  iCloudFindMyResponse
-} from './types/findmy.types.js';
+import { iCloudFindMyResponse } from './types/findmy.types.js';
 import { extractiCloudCookies } from './utils.js';
 
 export class FindMy {
@@ -62,7 +60,7 @@ export class FindMy {
           deviceListVersion: 1,
           selectedDevice: 'all',
         },
-      },
+      }
     )) as iCloudFindMyResponse;
     if (!result || !result.content) {
       throw new Error('Failed to get devices');
@@ -73,7 +71,7 @@ export class FindMy {
   async sendICloudRequest(
     service: keyof iCloudAccountInfo['webservices'],
     endpoint: string,
-    request: Record<string, unknown>,
+    request: Record<string, unknown>
   ): Promise<any> {
     if (!this.authenticatedData) {
       throw new Error('Unauthenticated');

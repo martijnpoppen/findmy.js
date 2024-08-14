@@ -29,11 +29,11 @@ interface iCloudCookiesRequest {
 export interface AuthenticatedData {
   cookies: CookieJar;
   accountInfo: iCloudAccountInfo;
-};
+}
 
 export async function AuthenticateFindMy(
   username: string,
-  password: string,
+  password: string
 ): Promise<AuthenticatedData> {
   const gsasrpAuthenticator = new GSASRPAuthenticator(username);
 
@@ -44,7 +44,7 @@ export async function AuthenticateFindMy(
 }
 
 async function AuthInit(
-  authenticator: GSASRPAuthenticator,
+  authenticator: GSASRPAuthenticator
 ): Promise<ServerSRPInitResponse> {
   const initData = await authenticator.getInit();
   const initResponse = await fetch(AUTH_ENDPOINT + 'signin/init', {
@@ -63,7 +63,7 @@ async function AuthInit(
 async function AuthComplete(
   authenticator: GSASRPAuthenticator,
   password: string,
-  initResponse: ServerSRPInitResponse,
+  initResponse: ServerSRPInitResponse
 ): Promise<AuthData> {
   const completeData = await authenticator.getComplete(password, initResponse);
 
@@ -80,7 +80,7 @@ async function AuthComplete(
       headers: AUTH_HEADERS,
       method: 'POST',
       body: JSON.stringify(authData),
-    },
+    }
   );
 
   // Both 200 and 409 are valid responses

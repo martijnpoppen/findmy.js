@@ -20,4 +20,3 @@ export function extractiCloudCookies(response: Response): Cookie[] {
 
   return cookies;
 }
-

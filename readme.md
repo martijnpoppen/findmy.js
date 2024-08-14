@@ -41,7 +41,9 @@ async function main() {
     console.log(`Battery: ${device.getBattery().percentage}%`);
     const location = device.getLocation();
     if (location) {
-      console.log(`Location: ${location.lat}, ${location.lon} with accuracy ${location.accuracy}`);
+      console.log(
+        `Location: ${location.lat}, ${location.lon} with accuracy ${location.accuracy}`
+      );
     } else {
       console.log('Location: unknown');
     }

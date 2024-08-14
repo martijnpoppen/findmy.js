@@ -38,10 +38,10 @@ export class GSASRPAuthenticator {
     protocol: 's2k' | 's2k_fo',
     password: string,
     salt: Uint8Array,
-    iterations: number,
+    iterations: number
   ) {
     let passHash = new Uint8Array(
-      await util.hash(srp.h, stringToU8Array(password)),
+      await util.hash(srp.h, stringToU8Array(password))
     );
 
     if (protocol == 's2k_fo') passHash = stringToU8Array(util.toHex(passHash));
@@ -51,7 +51,7 @@ export class GSASRPAuthenticator {
       passHash,
       { name: 'PBKDF2' },
       false,
-      ['deriveBits'],
+      ['deriveBits']
     );
 
     const derived = await crypto.subtle.deriveBits(
@@ -62,7 +62,7 @@ export class GSASRPAuthenticator {
         salt,
       },
       imported,
-      256,
+      256
     );
 
     return new Uint8Array(derived);
@@ -73,11 +73,11 @@ export class GSASRPAuthenticator {
     this.srpClient = await srp.newClient(
       stringToU8Array(this.username),
       // provide fake passsword because we need to get data from server
-      new Uint8Array(),
+      new Uint8Array()
     );
 
     const a = Buffer.from(util.bytesFromBigint(this.srpClient.A)).toString(
-      'base64',
+      'base64'
     );
     return {
       a,
@@ -88,7 +88,7 @@ export class GSASRPAuthenticator {
 
   async getComplete(
     password: string,
-    serverData: ServerSRPInitResponse,
+    serverData: ServerSRPInitResponse
   ): Promise<
     Pick<ServerSRPCompleteRequest, 'm1' | 'm2' | 'c' | 'accountName'>
   > {
@@ -101,7 +101,7 @@ export class GSASRPAuthenticator {
       serverData.protocol,
       password,
       salt,
-      iterations,
+      iterations
     );
 
     this.srpClient.p = derived;
