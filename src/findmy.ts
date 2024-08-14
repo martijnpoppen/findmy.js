@@ -11,11 +11,6 @@ import {
 } from './types/findmy.types.js';
 import { extractiCloudCookies } from './utils.js';
 
-type SerializedAuthenticatedData = {
-  cookies: CookieJar.Serialized;
-  accountInfo: iCloudAccountInfo;
-};
-
 export class FindMy {
   private authenticatedData: AuthenticatedData | null = null;
 
@@ -29,23 +24,6 @@ export class FindMy {
 
   isAuthenticated(): boolean {
     return !!this.authenticatedData;
-  }
-
-  importAuthData(authData: SerializedAuthenticatedData) {
-    this.authenticatedData = {
-      cookies: CookieJar.deserializeSync(authData.cookies),
-      accountInfo: authData.accountInfo,
-    };
-  }
-
-  exportAuthData(): SerializedAuthenticatedData {
-    if (!this.authenticatedData) {
-      throw new Error('Unauthenticated');
-    }
-    return {
-      cookies: this.authenticatedData.cookies.serializeSync(),
-      accountInfo: this.authenticatedData.accountInfo,
-    };
   }
 
   getRawAccountInfo() {
