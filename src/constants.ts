@@ -1,6 +1,7 @@
 export const CLIENT_ID = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 export const AUTH_ENDPOINT = "https://idmsa.apple.com/appleauth/auth/";
 export const SETUP_ENDPOINT = "https://setup.icloud.com/setup/ws/1/accountLogin";
+export const COOKIE_URL = "https://www.icloud.com";
 
 export const DEFAULT_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0",

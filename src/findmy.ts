@@ -1,7 +1,8 @@
-import { Cookie } from 'tough-cookie';
+import { Cookie, CookieJar } from 'tough-cookie';
 import {
   AUTH_ENDPOINT,
   AUTH_HEADERS,
+  COOKIE_URL,
   DEFAULT_HEADERS,
   SETUP_ENDPOINT,
 } from './constants.js';
@@ -11,10 +12,7 @@ import {
   ServerSRPInitResponse,
 } from './gsasrp-authenticator.js';
 import { iCloudAccountInfo } from './types/account.types.js';
-import {
-  iCloudFindMyDeviceInfo,
-  iCloudFindMyResponse,
-} from './types/findmy.types.js';
+import { iCloudFindMyDeviceInfo } from './types/findmy.types.js';
 
 interface AuthData {
   sessionId: string;
@@ -28,102 +26,82 @@ interface iCloudCookiesRequest {
   trustToken: string;
 }
 
+type AuthenticatedData = {
+  cookies: CookieJar;
+  accountInfo: iCloudAccountInfo;
+};
+
+type SerializedAuthenticatedData = {
+  cookies: CookieJar.Serialized;
+  accountInfo: iCloudAccountInfo;
+};
+
 export class FindMy {
   private authenticator = new GSASRPAuthenticator(this.username);
 
-  private authenticatedData: {
-    headers: Record<string, string>;
-    webServices: iCloudAccountInfo['webservices'];
-  } | null = null;
+  private authenticatedData: AuthenticatedData | null = null;
 
-  constructor(private username: string, private password: string) { }
+  constructor(private username: string, private password: string) {}
 
-  public async authenticate() {
+  async authenticate(): Promise<void> {
     const init = await this.authInit();
     const complete = await this.authComplete(init);
-    return await this.completeAuthentication(complete);
+    await this.completeAuthentication(complete);
   }
 
-  isAuthenticated() {
+  isAuthenticated(): boolean {
     return !!this.authenticatedData;
   }
 
-  public setAuthData(authData: any) {
-    this.authenticatedData = authData;
+  setAuthData(authData: SerializedAuthenticatedData) {
+    this.authenticatedData = {
+      cookies: CookieJar.deserializeSync(authData.cookies),
+      accountInfo: authData.accountInfo,
+    };
+  }
+
+  getAuthData(): SerializedAuthenticatedData {
+    if (!this.authenticatedData) {
+      throw new Error('Unauthenticated');
+    }
+    return {
+      cookies: this.authenticatedData.cookies.serializeSync(),
+      accountInfo: this.authenticatedData.accountInfo,
+    };
   }
 
   async getDevices(): Promise<Array<iCloudFindMyDeviceInfo>> {
-    if (!this.authenticatedData) {
-      throw new Error('Unauthenticated');
-    }
-
-    const serviceURI =
-      this.authenticatedData.webServices.findme.url;
-    const endpoint = serviceURI + '/fmipservice/client/web/refreshClient';
-
-    const request = {
-      clientContext: {
-        fmly: true,
-        shouldLocate: true,
-        deviceListVersion: 1,
-        selectedDevice: 'all',
+    const result = await this.sendRequest(
+      'findme',
+      '/fmipservice/client/web/refreshClient',
+      {
+        clientContext: {
+          fmly: true,
+          shouldLocate: true,
+          deviceListVersion: 1,
+          selectedDevice: 'all',
+        },
       },
-    };
-
-    const response = await fetch(endpoint, {
-      headers: this.authenticatedData.headers,
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
-
-    if (!response.ok) {
+    );
+    if (!result || !result.content) {
       throw new Error('Failed to get devices');
     }
-
-    const reply: iCloudFindMyResponse = await response.json();
-
-    return reply.content;
+    return result.content as Array<iCloudFindMyDeviceInfo>;
   }
 
-  public async playSound(deviceId: string) {
-    if (!this.authenticatedData) {
-      throw new Error('Unauthenticated');
-    }
-
-    const serviceURI =
-      this.authenticatedData.webServices.findme.url;
-    const endpoint = serviceURI + '/fmipservice/client/web/playSound';
-
-    const request = {
+  async playSound(deviceId: string) {
+    await this.sendRequest('findme', '/fmipservice/client/web/playSound', {
       device: deviceId,
       subject: 'Find My iPhone Alert',
       clientContext: {
         appVersion: '1.0',
         contextApp: 'com.icloud.web.fmf',
       },
-    };
-
-    const response = await fetch(endpoint, {
-      headers: this.authenticatedData.headers,
-      method: 'POST',
-      body: JSON.stringify(request),
     });
-
-    if (!response.ok) {
-      throw new Error('Failed to play sound');
-    }
   }
 
-  public async sendMessage(deviceId: string, subject: string, text: string) {
-    if (!this.authenticatedData) {
-      throw new Error('Unauthenticated');
-    }
-
-    const serviceURI =
-      this.authenticatedData.webServices.findme.url;
-    const endpoint = serviceURI + '/fmipservice/client/web/sendMessage';
-
-    const request = {
+  async sendMessage(deviceId: string, subject: string, text: string) {
+    await this.sendRequest('findme', '/fmipservice/client/web/sendMessage', {
       device: deviceId,
       clientContext: {
         appVersion: '1.0',
@@ -133,18 +111,42 @@ export class FindMy {
       userText: true,
       sound: false,
       subject,
-      text
-    };
+      text,
+    });
+  }
 
-    const response = await fetch(endpoint, {
-      headers: this.authenticatedData.headers,
+  private async sendRequest(
+    service: keyof iCloudAccountInfo['webservices'],
+    endpoint: string,
+    request: Record<string, unknown>,
+  ): Promise<any> {
+    if (!this.authenticatedData) {
+      throw new Error('Unauthenticated');
+    }
+
+    const serviceURI =
+      this.authenticatedData.accountInfo.webservices[service].url;
+    const fullEndpoint = serviceURI + endpoint;
+    const headers = this.getHeaders(this.authenticatedData.cookies);
+
+    const response = await fetch(fullEndpoint, {
+      headers: headers,
       method: 'POST',
       body: JSON.stringify(request),
     });
 
     if (!response.ok) {
-      throw new Error('Failed to send message');
+      throw new Error('Failed to send request');
     }
+
+    const cookies = this.extractiCloudCookies(response);
+    for (let cookie of cookies) {
+      this.authenticatedData.cookies.setCookieSync(cookie, COOKIE_URL);
+    }
+
+    const reply = await response.json();
+
+    return reply;
   }
 
   private async authInit(): Promise<ServerSRPInitResponse> {
@@ -194,30 +196,6 @@ export class FindMy {
     return this.extractAuthData(completeResponse);
   }
 
-  private async completeAuthentication(authData: AuthData) {
-    const data: iCloudCookiesRequest = {
-      dsWebAuthToken: authData.sessionId,
-      trustToken: authData.aasp,
-    };
-
-    const response = await fetch(SETUP_ENDPOINT, {
-      headers: DEFAULT_HEADERS,
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-
-    if (!response.ok) {
-      throw new Error('Failed to get iCloud cookies');
-    }
-
-    const accountInfo: iCloudAccountInfo = await response.json();
-    const cookies = this.extractiCloudCookies(response);
-
-    this.authenticatedData = { headers: this.getHeaders(cookies), webServices: accountInfo.webservices };
-
-    return this.authenticatedData;
-  }
-
   private extractAuthData(response: Response): AuthData {
     try {
       const sessionId = response.headers.get('X-Apple-Session-Token');
@@ -238,6 +216,37 @@ export class FindMy {
     }
   }
 
+  private async completeAuthentication(
+    authData: AuthData,
+  ): Promise<void> {
+    const data: iCloudCookiesRequest = {
+      dsWebAuthToken: authData.sessionId,
+      trustToken: authData.aasp,
+    };
+
+    const response = await fetch(SETUP_ENDPOINT, {
+      headers: DEFAULT_HEADERS,
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to finish iCloud authentication');
+    }
+
+    const accountInfo: iCloudAccountInfo = await response.json();
+    const cookies = new CookieJar();
+    for (let cookie of this.extractiCloudCookies(response)) {
+      cookies.setCookieSync(cookie, COOKIE_URL);
+    }
+
+    const authenticatedData: AuthenticatedData = {
+      cookies,
+      accountInfo,
+    };
+    this.authenticatedData = authenticatedData;
+  }
+
   private extractiCloudCookies(response: Response): Cookie[] {
     const cookies = Array.from(response.headers.entries())
       .filter((v) => v[0].toLowerCase() == 'set-cookie')
@@ -253,7 +262,8 @@ export class FindMy {
     return cookies;
   }
 
-  private getHeaders(cookies: Cookie[]): Record<string, string> {
+  private getHeaders(jar: CookieJar): Record<string, string> {
+    const cookies = jar.getCookiesSync(COOKIE_URL);
     return {
       ...DEFAULT_HEADERS,
       Cookie: cookies

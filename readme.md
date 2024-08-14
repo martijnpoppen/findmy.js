@@ -11,7 +11,6 @@ It works without requiring 2FA login, Find My is the only service that allows th
 ```javascript
 import { FindMy } from 'findmy.js';
 import prompt from 'prompt';
-import fs from 'fs';
 
 async function main() {
   prompt.start();
@@ -33,23 +32,7 @@ async function main() {
     result.password,
   );
 
-  if(fs.existsSync('authenticatedData.json')) {
-    const authenticatedData = JSON.parse(fs.readFileSync('authenticatedData.json', 'utf8'));
-
-    findmy.setAuthData(authenticatedData);
-  } else {
-    console.log('No authenticated data found');
-    
-    try {
-      const authData = await findmy.authenticate();
-
-      fs.writeFileSync('authenticatedData.json', JSON.stringify(authData, null, 2), 'utf8');
-    } catch (error) {
-      console.error('Failed to authenticate', error);
-      return
-    }
-  }
-
+  await findmy.authenticate();
   const devices = await findmy.getDevices();
 
   // For each device print name, battery and location
@@ -58,7 +41,11 @@ async function main() {
     console.log(`Name: ${device.name}`);
     console.log(`Model: ${device.deviceDisplayName}`);
     console.log(`Battery: ${device.batteryLevel * 100}%`);
-    console.log(`Location: ${device.location.latitude}, ${device.location.longitude}`);
+    if (device.location) {
+      console.log(`Location: ${device.location.latitude}, ${device.location.longitude}`);
+    } else {
+      console.log('Location: Not available');
+    }
     console.log('---');
   });
 }
