@@ -42,6 +42,7 @@ async function main() {
   // For each device print name, battery and location
   console.log('---');
   devices.forEach((device) => {
+    device = device.getRawInfo();
     console.log(`Name: ${device.name}`);
     console.log(`Model: ${device.deviceDisplayName}`);
     console.log(`Battery: ${device.batteryLevel * 100}%`);

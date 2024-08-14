@@ -1,11 +1,14 @@
 import { CookieJar } from 'tough-cookie';
+import { COOKIE_URL, DEFAULT_HEADERS } from './constants.js';
+import { FindMyDevice } from './device.js';
 import {
-  COOKIE_URL,
-  DEFAULT_HEADERS
-} from './constants.js';
-import { AuthenticatedData, AuthenticateFindMy } from './findmy-authentication.js';
+  AuthenticatedData,
+  AuthenticateFindMy,
+} from './findmy-authentication.js';
 import { iCloudAccountInfo } from './types/account.types.js';
-import { iCloudFindMyDeviceInfo } from './types/findmy.types.js';
+import {
+  iCloudFindMyResponse
+} from './types/findmy.types.js';
 import { extractiCloudCookies } from './utils.js';
 
 type SerializedAuthenticatedData = {
@@ -45,8 +48,33 @@ export class FindMy {
     };
   }
 
-  async getDevices(): Promise<Array<iCloudFindMyDeviceInfo>> {
-    const result = await this.sendRequest(
+  getRawAccountInfo() {
+    return this.authOrThrow.accountInfo;
+  }
+
+  getUserInfo() {
+    const data = this.authOrThrow.accountInfo;
+    return {
+      appleId: {
+        main: data.dsInfo.appleId,
+        alias: data.dsInfo.appleIdAliases,
+      },
+      email: data.dsInfo.primaryEmail,
+      localization: {
+        language: data.dsInfo.languageCode,
+        locale: data.dsInfo.locale,
+        country: data.dsInfo.countryCode,
+      },
+      name: {
+        full: data.dsInfo.fullName,
+        first: data.dsInfo.firstName,
+        last: data.dsInfo.lastName,
+      },
+    };
+  }
+
+  async getDevices(): Promise<Array<FindMyDevice>> {
+    const result = (await this.sendICloudRequest(
       'findme',
       '/fmipservice/client/web/refreshClient',
       {
@@ -57,40 +85,14 @@ export class FindMy {
           selectedDevice: 'all',
         },
       },
-    );
+    )) as iCloudFindMyResponse;
     if (!result || !result.content) {
       throw new Error('Failed to get devices');
     }
-    return result.content as Array<iCloudFindMyDeviceInfo>;
+    return result.content.map((device) => new FindMyDevice(this, device));
   }
 
-  async playSound(deviceId: string) {
-    await this.sendRequest('findme', '/fmipservice/client/web/playSound', {
-      device: deviceId,
-      subject: 'Find My iPhone Alert',
-      clientContext: {
-        appVersion: '1.0',
-        contextApp: 'com.icloud.web.fmf',
-      },
-    });
-  }
-
-  async sendMessage(deviceId: string, subject: string, text: string) {
-    await this.sendRequest('findme', '/fmipservice/client/web/sendMessage', {
-      device: deviceId,
-      clientContext: {
-        appVersion: '1.0',
-        contextApp: 'com.icloud.web.fmf',
-      },
-      vibrate: true,
-      userText: true,
-      sound: false,
-      subject,
-      text,
-    });
-  }
-
-  private async sendRequest(
+  async sendICloudRequest(
     service: keyof iCloudAccountInfo['webservices'],
     endpoint: string,
     request: Record<string, unknown>,
@@ -133,5 +135,12 @@ export class FindMy {
         .map((cookie) => cookie.cookieString())
         .join('; '),
     };
+  }
+
+  private get authOrThrow(): AuthenticatedData {
+    if (!this.authenticatedData) {
+      throw new Error('Unauthenticated');
+    }
+    return this.authenticatedData;
   }
 }
