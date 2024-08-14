@@ -1,35 +1,12 @@
-import { Cookie, CookieJar } from 'tough-cookie';
+import { CookieJar } from 'tough-cookie';
 import {
-  AUTH_ENDPOINT,
-  AUTH_HEADERS,
   COOKIE_URL,
-  DEFAULT_HEADERS,
-  SETUP_ENDPOINT,
+  DEFAULT_HEADERS
 } from './constants.js';
-import {
-  GSASRPAuthenticator,
-  ServerSRPCompleteRequest,
-  ServerSRPInitResponse,
-} from './gsasrp-authenticator.js';
+import { AuthenticatedData, AuthenticateFindMy } from './findmy-authentication.js';
 import { iCloudAccountInfo } from './types/account.types.js';
 import { iCloudFindMyDeviceInfo } from './types/findmy.types.js';
-
-interface AuthData {
-  sessionId: string;
-  sessionToken: string;
-  scnt: string;
-  aasp: string;
-}
-
-interface iCloudCookiesRequest {
-  dsWebAuthToken: string;
-  trustToken: string;
-}
-
-type AuthenticatedData = {
-  cookies: CookieJar;
-  accountInfo: iCloudAccountInfo;
-};
+import { extractiCloudCookies } from './utils.js';
 
 type SerializedAuthenticatedData = {
   cookies: CookieJar.Serialized;
@@ -37,30 +14,28 @@ type SerializedAuthenticatedData = {
 };
 
 export class FindMy {
-  private authenticator = new GSASRPAuthenticator(this.username);
-
   private authenticatedData: AuthenticatedData | null = null;
 
-  constructor(private username: string, private password: string) {}
+  async authenticate(username: string, password: string): Promise<void> {
+    this.authenticatedData = await AuthenticateFindMy(username, password);
+  }
 
-  async authenticate(): Promise<void> {
-    const init = await this.authInit();
-    const complete = await this.authComplete(init);
-    await this.completeAuthentication(complete);
+  deauthenticate() {
+    this.authenticatedData = null;
   }
 
   isAuthenticated(): boolean {
     return !!this.authenticatedData;
   }
 
-  setAuthData(authData: SerializedAuthenticatedData) {
+  importAuthData(authData: SerializedAuthenticatedData) {
     this.authenticatedData = {
       cookies: CookieJar.deserializeSync(authData.cookies),
       accountInfo: authData.accountInfo,
     };
   }
 
-  getAuthData(): SerializedAuthenticatedData {
+  exportAuthData(): SerializedAuthenticatedData {
     if (!this.authenticatedData) {
       throw new Error('Unauthenticated');
     }
@@ -139,7 +114,7 @@ export class FindMy {
       throw new Error('Failed to send request');
     }
 
-    const cookies = this.extractiCloudCookies(response);
+    const cookies = extractiCloudCookies(response);
     for (let cookie of cookies) {
       this.authenticatedData.cookies.setCookieSync(cookie, COOKIE_URL);
     }
@@ -147,119 +122,6 @@ export class FindMy {
     const reply = await response.json();
 
     return reply;
-  }
-
-  private async authInit(): Promise<ServerSRPInitResponse> {
-    const initData = await this.authenticator.getInit();
-    const initResponse = await fetch(AUTH_ENDPOINT + 'signin/init', {
-      headers: AUTH_HEADERS,
-      method: 'POST',
-      body: JSON.stringify(initData),
-    });
-
-    if (!initResponse.ok) {
-      throw new Error('Failed to authenticate');
-    }
-
-    return await initResponse.json();
-  }
-
-  private async authComplete(
-    initData: ServerSRPInitResponse,
-  ): Promise<AuthData> {
-    const completeData = await this.authenticator.getComplete(
-      this.password,
-      initData,
-    );
-
-    const authData: ServerSRPCompleteRequest = {
-      ...completeData,
-      trustTokens: [],
-      rememberMe: false,
-      pause2FA: true,
-    };
-
-    const completeResponse = await fetch(
-      AUTH_ENDPOINT + 'signin/complete?isRememberMeEnabled=true',
-      {
-        headers: AUTH_HEADERS,
-        method: 'POST',
-        body: JSON.stringify(authData),
-      },
-    );
-
-    // Both 200 and 409 are valid responses
-    if (!completeResponse.ok && completeResponse.status !== 409) {
-      throw new Error('Failed to authenticate');
-    }
-
-    return this.extractAuthData(completeResponse);
-  }
-
-  private extractAuthData(response: Response): AuthData {
-    try {
-      const sessionId = response.headers.get('X-Apple-Session-Token');
-      const sessionToken = sessionId;
-      const scnt = response.headers.get('scnt');
-
-      const headers = Array.from(response.headers.values());
-      const aaspCookie = headers.find((v) => v.includes('aasp='));
-      const aasp = aaspCookie?.split('aasp=')[1]?.split(';')[0];
-
-      if (!sessionId || !sessionToken || !scnt || !aasp) {
-        throw new Error('Failed to extract auth data');
-      }
-
-      return { sessionId, sessionToken, scnt, aasp } as AuthData;
-    } catch (e) {
-      throw new Error('Failed to extract auth data');
-    }
-  }
-
-  private async completeAuthentication(
-    authData: AuthData,
-  ): Promise<void> {
-    const data: iCloudCookiesRequest = {
-      dsWebAuthToken: authData.sessionId,
-      trustToken: authData.aasp,
-    };
-
-    const response = await fetch(SETUP_ENDPOINT, {
-      headers: DEFAULT_HEADERS,
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-
-    if (!response.ok) {
-      throw new Error('Failed to finish iCloud authentication');
-    }
-
-    const accountInfo: iCloudAccountInfo = await response.json();
-    const cookies = new CookieJar();
-    for (let cookie of this.extractiCloudCookies(response)) {
-      cookies.setCookieSync(cookie, COOKIE_URL);
-    }
-
-    const authenticatedData: AuthenticatedData = {
-      cookies,
-      accountInfo,
-    };
-    this.authenticatedData = authenticatedData;
-  }
-
-  private extractiCloudCookies(response: Response): Cookie[] {
-    const cookies = Array.from(response.headers.entries())
-      .filter((v) => v[0].toLowerCase() == 'set-cookie')
-      .map((v) => v[1].split(', '))
-      .reduce((a, b) => a.concat(b), [])
-      .map((v) => Cookie.parse(v))
-      .filter((v) => !!v);
-
-    if (cookies.length === 0) {
-      throw new Error('Failed to extract iCloud cookies');
-    }
-
-    return cookies;
   }
 
   private getHeaders(jar: CookieJar): Record<string, string> {

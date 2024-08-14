@@ -1,6 +1,6 @@
 import { Client, Hash, Mode, Srp, util } from '@foxt/js-srp';
 import crypto from 'crypto';
-import { base64ToU8Array, stringToU8Array } from './util.js';
+import { base64ToU8Array, stringToU8Array } from './utils.js';
 
 export type SRPProtocol = 's2k' | 's2k_fo';
 
