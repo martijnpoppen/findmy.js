@@ -32,20 +32,24 @@ export class FindMy {
   private authenticator = new GSASRPAuthenticator(this.username);
 
   private authenticatedData: {
-    cookies: Cookie[];
-    accountInfo: iCloudAccountInfo;
+    headers: any;
+    webServices: iCloudAccountInfo['webservices'];
   } | null = null;
 
-  constructor(private username: string, private password: string) {}
+  constructor(private username: string, private password: string) { }
 
-  async authenticate() {
+  public async authenticate() {
     const init = await this.authInit();
     const complete = await this.authComplete(init);
-    await this.completeAuthentication(complete);
+    return await this.completeAuthentication(complete);
   }
 
   isAuthenticated() {
     return !!this.authenticatedData;
+  }
+
+  public setAuthData(authData: any) {
+    this.authenticatedData = authData;
   }
 
   async getDevices(): Promise<Array<iCloudFindMyDeviceInfo>> {
@@ -54,7 +58,7 @@ export class FindMy {
     }
 
     const serviceURI =
-      this.authenticatedData.accountInfo.webservices.findme.url;
+      this.authenticatedData.webServices.findme.url;
     const endpoint = serviceURI + '/fmipservice/client/web/refreshClient';
 
     const request = {
@@ -67,7 +71,7 @@ export class FindMy {
     };
 
     const response = await fetch(endpoint, {
-      headers: this.getHeaders(),
+      headers: this.authenticatedData.headers,
       method: 'POST',
       body: JSON.stringify(request),
     });
@@ -79,6 +83,68 @@ export class FindMy {
     const reply: iCloudFindMyResponse = await response.json();
 
     return reply.content;
+  }
+
+  public async playSound(deviceId: string) {
+    if (!this.authenticatedData) {
+      throw new Error('Unauthenticated');
+    }
+
+    const serviceURI =
+      this.authenticatedData.webServices.findme.url;
+    const endpoint = serviceURI + '/fmipservice/client/web/playSound';
+
+    const request = {
+      device: deviceId,
+      subject: 'Find My iPhone Alert',
+      clientContext: {
+        appVersion: '1.0',
+        contextApp: 'com.icloud.web.fmf',
+      },
+    };
+
+    const response = await fetch(endpoint, {
+      headers: this.authenticatedData.headers,
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to play sound');
+    }
+  }
+
+  public async sendMessage(deviceId: string, subject: string, text: string) {
+    if (!this.authenticatedData) {
+      throw new Error('Unauthenticated');
+    }
+
+    const serviceURI =
+      this.authenticatedData.webServices.findme.url;
+    const endpoint = serviceURI + '/fmipservice/client/web/sendMessage';
+
+    const request = {
+      device: deviceId,
+      clientContext: {
+        appVersion: '1.0',
+        contextApp: 'com.icloud.web.fmf',
+      },
+      vibrate: true,
+      userText: true,
+      sound: false,
+      subject,
+      text
+    };
+
+    const response = await fetch(endpoint, {
+      headers: this.authenticatedData.headers,
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to send message');
+    }
   }
 
   private async authInit(): Promise<ServerSRPInitResponse> {
@@ -147,7 +213,9 @@ export class FindMy {
     const accountInfo: iCloudAccountInfo = await response.json();
     const cookies = this.extractiCloudCookies(response);
 
-    this.authenticatedData = { cookies, accountInfo };
+    this.authenticatedData = { headers: this.getHeaders(cookies), webServices: accountInfo.webservices };
+
+    return this.authenticatedData;
   }
 
   private extractAuthData(response: Response): AuthData {
@@ -185,14 +253,10 @@ export class FindMy {
     return cookies;
   }
 
-  private getHeaders(): Record<string, string> {
-    if (!this.authenticatedData) {
-      throw new Error('Unauthenticated');
-    }
-
+  private getHeaders(cookies: Cookie[]): Record<string, string> {
     return {
       ...DEFAULT_HEADERS,
-      Cookie: this.authenticatedData.cookies
+      Cookie: cookies
         .filter((a) => a.value)
         .map((cookie) => cookie.cookieString())
         .join('; '),
