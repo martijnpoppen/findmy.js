@@ -25,12 +25,14 @@
   },
   "type": "module",
   "devDependencies": {
-    "@types/tough-cookie": "^4.0.5",
     "@types/node": "^20.14.9",
+    "@types/tough-cookie": "^4.0.5",
     "typescript": "^5.5.2"
   },
   "dependencies": {
     "@foxt/js-srp": "0.0.3-patch2",
-    "tough-cookie": "^4.1.4"
+    "cross-fetch": "^4.0.0",
+    "tough-cookie": "^4.1.4",
+    "uncrypto": "^0.1.3"
   }
 }

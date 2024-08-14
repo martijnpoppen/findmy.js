@@ -1,4 +1,5 @@
 import { Cookie } from 'tough-cookie';
+import fetch from 'cross-fetch';
 import {
   AUTH_ENDPOINT,
   AUTH_HEADERS,

@@ -1,5 +1,5 @@
 import { Client, Hash, Mode, Srp, util } from '@foxt/js-srp';
-import crypto from 'crypto';
+import { subtle } from "uncrypto";
 import { base64ToU8Array, stringToU8Array } from './util.js';
 
 export type SRPProtocol = 's2k' | 's2k_fo';
@@ -46,7 +46,8 @@ export class GSASRPAuthenticator {
 
     if (protocol == 's2k_fo') passHash = stringToU8Array(util.toHex(passHash));
 
-    const imported = await crypto.subtle.importKey(
+
+    const imported = await subtle.importKey(
       'raw',
       passHash,
       { name: 'PBKDF2' },
@@ -54,7 +55,7 @@ export class GSASRPAuthenticator {
       ['deriveBits'],
     );
 
-    const derived = await crypto.subtle.deriveBits(
+    const derived = await subtle.deriveBits(
       {
         name: 'PBKDF2',
         hash: { name: 'SHA-256' },
