@@ -32,7 +32,7 @@ export class FindMy {
   private authenticator = new GSASRPAuthenticator(this.username);
 
   private authenticatedData: {
-    headers: any;
+    headers: Record<string, string>;
     webServices: iCloudAccountInfo['webservices'];
   } | null = null;
 
