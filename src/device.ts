@@ -18,6 +18,10 @@ export class FindMyDevice {
     return this.info.name;
   }
 
+  getID(): string {
+    return this.info.id;
+  }
+
   getModel() {
     return {
       name: this.info.modelDisplayName,
