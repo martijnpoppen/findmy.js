@@ -54,6 +54,7 @@ async function AuthInit(
   });
 
   if (!initResponse.ok) {
+    console.log('authInit failed', initResponse);
     throw new Error('Failed to authenticate');
   }
 
@@ -85,6 +86,7 @@ async function AuthComplete(
 
   // Both 200 and 409 are valid responses
   if (!completeResponse.ok && completeResponse.status !== 409) {
+    console.log('authComplete failed', completeResponse);
     throw new Error('Failed to authenticate');
   }
 

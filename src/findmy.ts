@@ -49,14 +49,14 @@ export class FindMy {
     };
   }
 
-  async getDevices(): Promise<Array<FindMyDevice>> {
+  async getDevices(shouldLocate = true): Promise<Array<FindMyDevice>> {
     const result = (await this.sendICloudRequest(
       'findme',
       '/fmipservice/client/web/refreshClient',
       {
         clientContext: {
           fmly: true,
-          shouldLocate: true,
+          shouldLocate,
           deviceListVersion: 1,
           selectedDevice: 'all',
         },
