@@ -1,22 +1,31 @@
 import { Cookie } from 'tough-cookie';
+import { Response } from 'node-fetch';
+import https from 'https';
+
+const agent = new https.Agent({ family: 4 });
 
 const stringToU8Array = (str: string) => new TextEncoder().encode(str);
 const base64ToU8Array = (str: string) =>
-  Uint8Array.from(Buffer.from(str, 'base64'));
+    Uint8Array.from(Buffer.from(str, 'base64'));
 
 export { base64ToU8Array, stringToU8Array };
 
 export function extractiCloudCookies(response: Response): Cookie[] {
-  const cookies = Array.from(response.headers.entries())
-    .filter((v) => v[0].toLowerCase() == 'set-cookie')
-    .map((v) => v[1].split(', '))
-    .reduce((a, b) => a.concat(b), [])
-    .map((v) => Cookie.parse(v))
-    .filter((v) => !!v);
+    const cookies = Array.from(response.headers.entries())
+        .filter((v) => v[0].toLowerCase() == 'set-cookie')
+        .map((v) => v[1].split(', '))
+        .reduce((a, b) => a.concat(b), [])
+        .map((v) => Cookie.parse(v))
+        .filter((v) => !!v);
 
-  if (cookies.length === 0) {
-    throw new Error('Failed to extract iCloud cookies');
-  }
+    if (cookies.length === 0) {
+        throw new Error('Failed to extract iCloud cookies');
+    }
 
-  return cookies;
+    return cookies;
 }
+
+
+export const fetchOptions = {
+    agent
+};
