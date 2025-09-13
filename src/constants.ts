@@ -3,6 +3,8 @@ export const CLIENT_ID =
 export const AUTH_ENDPOINT = 'https://idmsa.apple.com/appleauth/auth/';
 export const SETUP_ENDPOINT =
   'https://setup.icloud.com/setup/ws/1/accountLogin';
+export const GET_TERMS_SETUP_ENDPOINT = 'https://setup.icloud.com/setup/ws/1/getTerms';
+export const ACCEPT_TERMS_ENDPOINT = 'https://setup.icloud.com/setup/ws/1/repairDone';
 export const COOKIE_URL = 'https://www.icloud.com';
 
 export const DEFAULT_HEADERS = {

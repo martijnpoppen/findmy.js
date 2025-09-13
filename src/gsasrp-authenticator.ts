@@ -41,7 +41,7 @@ export class GSASRPAuthenticator {
     iterations: number
   ) {
     let passHash = new Uint8Array(
-      await util.hash(srp.h, stringToU8Array(password))
+      await util.hash(srp.h, stringToU8Array(password).buffer)
     );
 
     if (protocol == 's2k_fo') passHash = stringToU8Array(util.toHex(passHash));

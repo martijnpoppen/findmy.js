@@ -41,6 +41,7 @@ export async function AuthenticateFindMy(
     const init = await AuthInit(gsasrpAuthenticator);
     const complete = await AuthComplete(gsasrpAuthenticator, password, init);
     const result = await AuthFinish(complete);
+
     return result;
 }
 
@@ -57,7 +58,7 @@ async function AuthInit(
 
     if (!initResponse.ok) {
         console.log('authInit failed', initResponse);
-        throw new Error('Failed to authenticate');
+        throw new Error('Failed to authenticate.');
     }
 
     // @ts-ignore
@@ -74,12 +75,12 @@ async function AuthComplete(
     const authData: ServerSRPCompleteRequest = {
         ...completeData,
         trustTokens: [],
-        rememberMe: false,
+        rememberMe: true,
         pause2FA: true,
     };
 
     const completeResponse = await fetch(
-        AUTH_ENDPOINT + 'signin/complete?isRememberMeEnabled=true',
+        AUTH_ENDPOINT + 'signin/complete',
         {
             headers: AUTH_HEADERS,
             method: 'POST',
