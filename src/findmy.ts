@@ -14,16 +14,6 @@ export class FindMy {
     private authenticatedData: AuthenticatedData | null = null;
 
     async authenticate(username: string, password: string): Promise<void> {
-        const resp1 = await fetch('https://ip6.me/api/', {
-            method: 'GET',
-            ...fetchOptions
-        });
-
-        const resp2 = await fetch('https://ip6.me/api/', {});
-
-        console.log('[Authenticate] with enforce ipv4', await resp1.text());
-        console.log('[Authenticate] without enforce ', await resp2.text());
-
         this.authenticatedData = await AuthenticateFindMy(username, password);
     }
 
@@ -32,8 +22,9 @@ export class FindMy {
     }
 
 
-    termsUpdateNeeded(): boolean {
-        return this.authOrThrow.accountInfo.termsUpdateNeeded;
+    termsUpdateNeeded() {
+        if (!this.authenticatedData) return false;
+        return !!this.authenticatedData.accountInfo?.termsUpdateNeeded;
     }
 
     isAuthenticated(): boolean {

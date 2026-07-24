@@ -8,7 +8,6 @@
     "test": "node index.js"
   },
   "dependencies": {
-    "findmy.js": "link:..",
     "prompt": "^1.3.0"
   }
 }

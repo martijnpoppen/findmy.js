@@ -1,5 +1,6 @@
-import { FindMy } from 'findmy.js';
+import { FindMy } from '../dist/index.js';
 import prompt from 'prompt';
+
 
 async function main() {
   prompt.start();
@@ -7,19 +8,15 @@ async function main() {
   console.log('Logging in...');
   const findmy = new FindMy();
 
-  const result = await prompt.get({
-    properties: {
-      username: {
-        description: 'Apple ID',
-      },
-      password: {
-        description: 'Password',
-        hidden: true,
-      },
-    },
-  });
+
+  const result = {
+    username: 'user',
+    password: 'pass',
+  }
 
   await findmy.authenticate(result.username, result.password);
+
+
   const devices = await findmy.getDevices();
 
   // For each device print name, battery and location
