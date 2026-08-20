@@ -3,6 +3,7 @@ export const OAUTH_STATE = `auth-${crypto.randomUUID()}`;
 export const AUTH_ENDPOINT = 'https://idmsa.apple.com/appleauth/auth/';
 export const SETUP_ENDPOINT =
   'https://setup.icloud.com/setup/ws/1/accountLogin';
+export const VALIDATE_ENDPOINT = 'https://setup.icloud.com/setup/ws/1/validate';
 export const GET_TERMS_SETUP_ENDPOINT = 'https://setup.icloud.com/setup/ws/1/getTerms';
 export const ACCEPT_TERMS_ENDPOINT = 'https://setup.icloud.com/setup/ws/1/repairDone';
 export const COOKIE_URL = 'https://www.icloud.com';

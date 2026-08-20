@@ -23,6 +23,13 @@ interface iCloudCookiesRequest {
 export interface AuthenticatedData {
     cookies: CookieJar;
     accountInfo: iCloudAccountInfo;
+    /**
+     * The `aasp` cookie Apple hands back on a successful sign-in. Feeding it
+     * into the next sign-in marks that sign-in as coming from an already
+     * trusted client, which is what keeps Apple from treating every
+     * reconnect as a brand new web login worth alerting the user about.
+     */
+    trustToken: string;
 }
 
 /**
@@ -71,15 +78,16 @@ class AuthSession {
 
 export async function AuthenticateFindMy(
     username: string,
-    password: string
+    password: string,
+    trustToken?: string
 ): Promise<AuthenticatedData> {
     const authenticator = new GSASRPAuthenticator(username);
     const session = new AuthSession();
 
     const init = await AuthInit(authenticator, session);
-    await AuthComplete(authenticator, password, init, session);
+    await AuthComplete(authenticator, password, init, session, trustToken);
 
-    return AuthFinish(session);
+    return AuthFinish(session, trustToken);
 }
 
 async function AuthInit(
@@ -108,17 +116,23 @@ async function AuthComplete(
     authenticator: GSASRPAuthenticator,
     password: string,
     initResponse: ServerSRPInitResponse,
-    session: AuthSession
+    session: AuthSession,
+    trustToken?: string
 ): Promise<AuthSession> {
     const completeData = await authenticator.getComplete(password, initResponse);
+
+    // Only opt into remember-me when we actually have a token to present.
+    // Without one the previous behaviour is kept verbatim, so a first-time
+    // sign-in behaves exactly as it did before.
+    const remembered = !!trustToken;
 
     const res = await fetch(AUTH_ENDPOINT + 'signin/complete?isRememberMeEnabled=true', {
         headers: { ...AUTH_HEADERS, ...session.headers() },
         method: 'POST',
         body: JSON.stringify({
             ...completeData,
-            trustTokens: [],
-            rememberMe: false,
+            trustTokens: remembered ? [trustToken] : [],
+            rememberMe: remembered,
             pause2FA: true,
         }),
         ...fetchOptions,
@@ -142,10 +156,15 @@ async function AuthComplete(
     return session;
 }
 
-async function AuthFinish(session: AuthSession): Promise<AuthenticatedData> {
+async function AuthFinish(
+    session: AuthSession,
+    previousTrustToken?: string
+): Promise<AuthenticatedData> {
+    const trustToken = session.cookies['aasp'] ?? previousTrustToken ?? '';
+
     const data: iCloudCookiesRequest = {
         dsWebAuthToken: session.token as string,
-        trustToken: session.cookies['aasp'] ?? '',
+        trustToken,
         extended_login: true,
     };
 
@@ -167,5 +186,5 @@ async function AuthFinish(session: AuthSession): Promise<AuthenticatedData> {
         cookies.setCookieSync(cookie, COOKIE_URL);
     }
 
-    return { cookies, accountInfo };
+    return { cookies, accountInfo, trustToken };
 }
