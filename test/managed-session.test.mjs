@@ -20,6 +20,8 @@ const storedSession = (trustToken = 'trust-me') => ({
     cookies: { version: 'tough-cookie@4', storeType: 'MemoryCookieStore', cookies: [] },
     accountInfo: { webservices: { findme: { url: 'https://p111-fmipweb.icloud.com' } } },
     trustToken,
+    sessionToken: 'ds-web-auth-token',
+    accountCountry: 'NLD',
     createdAt: 0,
 });
 
@@ -39,7 +41,7 @@ function memoryStore(initial = {}) {
 
 /** Scriptable stand-in for the FindMy client. */
 function fakeClient(script = {}) {
-    const calls = { authenticate: 0, validate: 0, getDevices: 0 };
+    const calls = { authenticate: 0, validate: 0, getDevices: 0, renew: 0 };
     let authenticated = false;
 
     return {
@@ -49,6 +51,12 @@ function fakeClient(script = {}) {
         deauthenticate() { authenticated = false; },
         termsUpdateNeeded: () => false,
         getTrustToken: () => 'fresh-token',
+        async renewWithToken() {
+            calls.renew += 1;
+            const outcome = script.renew?.(calls.renew);
+            if (outcome instanceof Error) throw outcome;
+            return outcome ?? false;
+        },
         exportSession: () => (authenticated ? storedSession() : null),
         async validateSession() {
             calls.validate += 1;
@@ -370,4 +378,111 @@ test('re-setting the same credentials does not clear the backoff', async () => {
 
     session.setCredentials('someone@example.com', 'hunter2');
     assert.equal(session.isBackingOff, true, 'nothing changed, so nothing is reconsidered');
+});
+
+test('a 450 recovers by renewing the token, with no sign-in', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({
+        store,
+        script: {
+            getDevices: (n) => (n === 1 ? new ICloudRequestError('x', 450, '') : undefined),
+            renew: () => true,
+        },
+    });
+
+    // The reported failure: a restart, a stored session, an immediate 450.
+    const devices = await session.getDevices();
+
+    assert.equal(client.calls.renew, 1, 'the stored token was replayed');
+    assert.equal(client.calls.authenticate, 0, 'and no sign-in, so no Apple login alert');
+    assert.equal(client.calls.getDevices, 2, 'the call was retried after renewing');
+    assert.deepEqual(devices, [{ id: 'device-1' }]);
+    assert.equal(store.calls.clear, 0, 'the stored session was never discarded');
+});
+
+test('the renewed session is written back', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({
+        store,
+        script: {
+            getDevices: (n) => (n === 1 ? new ICloudRequestError('x', 421, '') : undefined),
+            renew: () => true,
+        },
+    });
+
+    const before = store.calls.save;
+    await session.getDevices();
+
+    assert.ok(store.calls.save > before, 'fresh cookies are persisted straight away');
+    assert.equal(client.calls.authenticate, 0);
+});
+
+test('a refused token falls back to a sign-in', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({
+        store,
+        script: {
+            getDevices: (n) => (n <= 1 ? new ICloudRequestError('x', 450, '') : undefined),
+            renew: () => false,
+        },
+    });
+
+    await session.getDevices();
+
+    assert.equal(client.calls.renew, 1, 'renewal is tried first');
+    assert.equal(client.calls.authenticate, 1, 'and only then a sign-in');
+});
+
+test('renewal is attempted once per call, not in a loop', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({
+        store,
+        script: {
+            getDevices: () => new ICloudRequestError('x', 450, ''),
+            renew: () => true,
+        },
+    });
+
+    // Renewal keeps "succeeding" but the call keeps failing. Without a guard
+    // this would renew forever.
+    await assert.rejects(() => session.getDevices(), RetryLaterError);
+
+    assert.equal(client.calls.renew, 1);
+    assert.equal(client.calls.authenticate, 1, 'one sign-in, then it backs off');
+});
+
+test('a network failure during renewal backs off instead of signing in', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({
+        store,
+        script: {
+            getDevices: () => new ICloudRequestError('x', 450, ''),
+            renew: () => dnsError(),
+        },
+    });
+
+    await assert.rejects(() => session.getDevices(), RetryLaterError);
+
+    assert.equal(client.calls.authenticate, 0, 'the network was down, not the token');
+    assert.equal(store.calls.clear, 0, 'the stored session is kept');
+});
+
+test('two days of 450s cost no sign-ins at all when the token still works', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    let call = 0;
+    const { session, client } = makeSession({
+        store,
+        clock,
+        // Every other call is rejected; renewal always works.
+        script: { getDevices: () => (++call % 2 ? new ICloudRequestError('x', 450, '') : undefined), renew: () => true },
+    });
+
+    while (clock.t < 2 * 24 * 60 * 60 * 1000) {
+        await session.getDevices().catch(() => {});
+        clock.t += 60_000;
+    }
+
+    assert.equal(client.calls.authenticate, 0, 'zero login alerts across two days');
+    assert.ok(client.calls.renew > 100, 'recovered by renewing throughout');
 });

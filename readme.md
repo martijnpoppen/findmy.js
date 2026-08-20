@@ -94,6 +94,12 @@ try {
 A `load` that throws is treated as "nothing stored". Without a `store` the
 session still works, it just cannot survive a restart.
 
+Find My answers `450` when it wants the session re-established. That is not a
+request to sign in again: `FindMySession` replays the stored session token
+against `accountLogin`, which mints fresh cookies without touching `idmsa` and
+without an Apple login alert. A real sign-in happens only once Apple refuses
+that token.
+
 ## Credits
 
 Thanks to [Foxt](https://github.com/foxt) for most of the implementation of the Apple login system.

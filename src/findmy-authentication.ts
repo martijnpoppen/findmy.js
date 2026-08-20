@@ -11,6 +11,7 @@ import {
     ServerSRPInitResponse,
 } from './gsasrp-authenticator.js';
 import { iCloudAccountInfo } from './types/account.types.js';
+import { ICloudRequestError } from './errors.js';
 import { extractiCloudCookies, fetchOptions } from './utils.js';
 import fetch, { Response } from 'node-fetch';
 
@@ -18,6 +19,7 @@ interface iCloudCookiesRequest {
     dsWebAuthToken: string;
     trustToken: string;
     extended_login: boolean;
+    accountCountryCode?: string;
 }
 
 export interface AuthenticatedData {
@@ -30,6 +32,13 @@ export interface AuthenticatedData {
      * reconnect as a brand new web login worth alerting the user about.
      */
     trustToken: string;
+    /**
+     * The token accountLogin was minted from. Replaying it against
+     * accountLogin mints fresh cookies without touching idmsa, which is the
+     * difference between recovering silently and setting off a login alert.
+     */
+    sessionToken: string;
+    accountCountry: string;
 }
 
 /**
@@ -43,6 +52,8 @@ class AuthSession {
     scnt: string | null = null;
     sid: string | null = null;
     token: string | null = null;
+    accountCountry: string | null = null;
+    twosvTrustToken: string | null = null;
 
     absorb(res: Response): this {
         const raw: string[] = res.headers.raw()['set-cookie'] || [];
@@ -58,6 +69,10 @@ class AuthSession {
         this.scnt = res.headers.get('scnt') || this.scnt;
         this.sid = res.headers.get('X-Apple-ID-Session-Id') || this.sid;
         this.token = res.headers.get('X-Apple-Session-Token') || this.token;
+        this.accountCountry =
+            res.headers.get('X-Apple-ID-Account-Country') || this.accountCountry;
+        this.twosvTrustToken =
+            res.headers.get('X-Apple-TwoSV-Trust-Token') || this.twosvTrustToken;
 
         return this;
     }
@@ -160,12 +175,16 @@ async function AuthFinish(
     session: AuthSession,
     previousTrustToken?: string
 ): Promise<AuthenticatedData> {
-    const trustToken = session.cookies['aasp'] ?? previousTrustToken ?? '';
+    const trustToken =
+        session.twosvTrustToken ?? session.cookies['aasp'] ?? previousTrustToken ?? '';
 
     const data: iCloudCookiesRequest = {
         dsWebAuthToken: session.token as string,
         trustToken,
         extended_login: true,
+        ...(session.accountCountry
+            ? { accountCountryCode: session.accountCountry }
+            : {}),
     };
 
     const response = await fetch(SETUP_ENDPOINT, {
@@ -179,6 +198,8 @@ async function AuthFinish(
         throw new Error(`accountLogin ${response.status}: ${await response.text()}`);
     }
 
+    session.absorb(response);
+
     const accountInfo = await response.json() as iCloudAccountInfo;
 
     const cookies = new CookieJar();
@@ -186,5 +207,73 @@ async function AuthFinish(
         cookies.setCookieSync(cookie, COOKIE_URL);
     }
 
-    return { cookies, accountInfo, trustToken };
+    return {
+        cookies,
+        accountInfo,
+        trustToken: session.twosvTrustToken ?? trustToken,
+        sessionToken: session.token ?? '',
+        accountCountry: session.accountCountry ?? '',
+    };
 }
+
+/**
+ * Mint a fresh set of iCloud cookies from the token the current session was
+ * built with, the way pyicloud and icloudpy recover from a 450. This never
+ * touches idmsa, so it costs no SRP handshake and no Apple login alert.
+ *
+ * Returns null when Apple refuses the token — then, and only then, is a real
+ * sign-in the answer. Transport failures are thrown so the caller can back off
+ * instead of mistaking a flaky connection for a dead token.
+ */
+export async function RenewFindMySession(
+    current: AuthenticatedData
+): Promise<AuthenticatedData | null> {
+    if (!current.sessionToken) return null;
+
+    const data: iCloudCookiesRequest = {
+        dsWebAuthToken: current.sessionToken,
+        trustToken: current.trustToken ?? '',
+        extended_login: true,
+        ...(current.accountCountry
+            ? { accountCountryCode: current.accountCountry }
+            : {}),
+    };
+
+    const response = await fetch(SETUP_ENDPOINT, {
+        headers: DEFAULT_HEADERS,
+        method: 'POST',
+        body: JSON.stringify(data),
+        ...fetchOptions,
+    });
+
+    if (!response.ok) {
+        if (RENEWAL_REFUSED.has(response.status)) return null;
+
+        throw new ICloudRequestError(
+            SETUP_ENDPOINT,
+            response.status,
+            await response.text().catch(() => '')
+        );
+    }
+
+    const accountInfo = await response.json() as iCloudAccountInfo;
+
+    const cookies = new CookieJar();
+    for (const cookie of extractiCloudCookies(response)) {
+        cookies.setCookieSync(cookie, COOKIE_URL);
+    }
+
+    return {
+        cookies,
+        accountInfo,
+        trustToken:
+            response.headers.get('X-Apple-TwoSV-Trust-Token') || current.trustToken,
+        sessionToken:
+            response.headers.get('X-Apple-Session-Token') || current.sessionToken,
+        accountCountry:
+            response.headers.get('X-Apple-ID-Account-Country') ||
+            current.accountCountry,
+    };
+}
+
+const RENEWAL_REFUSED = new Set([401, 403, 421, 450]);

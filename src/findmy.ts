@@ -4,6 +4,7 @@ import { FindMyDevice } from './device.js';
 import {
     AuthenticatedData,
     AuthenticateFindMy,
+    RenewFindMySession,
 } from './findmy-authentication.js';
 import {
     ICloudRequestError,
@@ -29,6 +30,9 @@ export interface SerializedSession {
     cookies: SerializedCookieJar;
     accountInfo: iCloudAccountInfo;
     trustToken: string;
+    /** Lets a restored session mint fresh cookies without a sign-in. */
+    sessionToken: string;
+    accountCountry: string;
     createdAt: number;
 }
 
@@ -66,6 +70,8 @@ export class FindMy {
             cookies: this.authenticatedData.cookies.toJSON(),
             accountInfo: this.authenticatedData.accountInfo,
             trustToken: this.authenticatedData.trustToken,
+            sessionToken: this.authenticatedData.sessionToken,
+            accountCountry: this.authenticatedData.accountCountry,
             createdAt: this.sessionCreatedAt ?? Date.now(),
         };
     }
@@ -86,6 +92,8 @@ export class FindMy {
             cookies: CookieJar.fromJSON(session.cookies as any),
             accountInfo: session.accountInfo,
             trustToken: session.trustToken ?? '',
+            sessionToken: session.sessionToken ?? '',
+            accountCountry: session.accountCountry ?? '',
         };
         this.sessionCreatedAt = session.createdAt ?? Date.now();
     }
@@ -117,6 +125,28 @@ export class FindMy {
             }
             throw error;
         }
+    }
+
+    /**
+     * Mint fresh cookies from the token this session was built with. This is
+     * the right answer to a 450 from Find My: iCloud is asking for the session
+     * to be re-established, not for the account to sign in again, and doing it
+     * this way costs no Apple login alert.
+     *
+     * Returns false when Apple refuses the token, which is the only case where
+     * a real sign-in is warranted.
+     */
+    async renewWithToken(): Promise<boolean> {
+        if (!this.authenticatedData?.sessionToken) return false;
+
+        const renewed = await RenewFindMySession(this.authenticatedData);
+
+        if (!renewed) return false;
+
+        this.authenticatedData = renewed;
+        this.sessionCreatedAt = Date.now();
+
+        return true;
     }
 
     /** Age of the current session in milliseconds, or null when there is none. */
