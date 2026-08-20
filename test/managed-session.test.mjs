@@ -48,6 +48,7 @@ function fakeClient(script = {}) {
         isAuthenticated: () => authenticated,
         deauthenticate() { authenticated = false; },
         termsUpdateNeeded: () => false,
+        getTrustToken: () => 'fresh-token',
         exportSession: () => (authenticated ? storedSession() : null),
         async validateSession() {
             calls.validate += 1;
@@ -87,20 +88,24 @@ function makeSession({ store, script = {}, clock = { t: 1_000_000 }, ...rest } =
     return { session, client, clock };
 }
 
-test('a stored session is reused instead of signing in', async () => {
+test('a stored session is used directly, with no sign-in and no pre-flight', async () => {
     const store = memoryStore({ 'account-key': storedSession() });
     const { session, client } = makeSession({ store });
 
     const devices = await session.getDevices();
 
     assert.equal(client.calls.authenticate, 0, 'no sign-in, so no Apple login alert');
-    assert.equal(client.calls.validate, 1, 'the stored session was checked first');
+    assert.equal(client.calls.validate, 0, 'and no extra round trip to ask if it works');
+    assert.equal(client.calls.getDevices, 1, 'the real call is the check');
     assert.deepEqual(devices, [{ id: 'device-1' }]);
 });
 
-test('a rejected stored session falls back to a sign-in', async () => {
+test('a stored session iCloud rejects falls back to a sign-in', async () => {
     const store = memoryStore({ 'account-key': storedSession('old-token') });
-    const { session, client } = makeSession({ store, script: { validate: () => false } });
+    const { session, client } = makeSession({
+        store,
+        script: { getDevices: (n) => (n === 1 ? new ICloudRequestError('x', 450, '') : undefined) },
+    });
 
     await session.getDevices();
 
@@ -109,14 +114,29 @@ test('a rejected stored session falls back to a sign-in', async () => {
     assert.equal(store.calls.save >= 1, true, 'the new session is stored');
 });
 
-test('a network failure while validating never causes a sign-in', async () => {
+test('a network failure against a stored session never causes a sign-in', async () => {
     const store = memoryStore({ 'account-key': storedSession() });
-    const { session, client } = makeSession({ store, script: { validate: () => dnsError() } });
+    const { session, client } = makeSession({ store, script: { getDevices: () => dnsError() } });
 
     await assert.rejects(() => session.getDevices(), RetryLaterError);
 
     assert.equal(client.calls.authenticate, 0, 'the network was down, not the session');
     assert.equal(store.calls.clear, 0, 'the stored session is left intact');
+});
+
+test('new credentials are proven rather than shadowed by a working session', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client } = makeSession({ store });
+
+    await session.getDevices();
+    assert.equal(client.calls.authenticate, 0, 'the stored session serves the first call');
+
+    // Someone re-paired with a different password. Reusing the old session
+    // here would let a wrong password look correct and fail later.
+    session.setCredentials('someone@example.com', 'a-different-password');
+    await session.getDevices();
+
+    assert.equal(client.calls.authenticate, 1, 'the new password is actually tried');
 });
 
 test('repeated network failures back off and never sign in', async () => {
@@ -298,4 +318,56 @@ test('a session works without a store, it just cannot survive a restart', async 
     await session.getDevices();
 
     assert.equal(client.calls.authenticate, 1, 'signs in once and keeps it in memory');
+});
+
+test('a failed sign-in still paces the next one', async () => {
+    const store = memoryStore();
+    const clock = { t: 1_000_000 };
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: { authenticate: () => new Error('signin/complete 401: bad password') },
+    });
+
+    await assert.rejects(() => session.getDevices());
+    assert.equal(client.calls.authenticate, 1);
+
+    // The failure has to stick to the session, or a caller that rebuilds it
+    // every poll would retry the sign-in every poll.
+    assert.equal(session.isBackingOff, true);
+    assert.equal(session.nextAttemptAt - clock.t, 300_000);
+});
+
+test('new credentials clear the backoff', async () => {
+    const store = memoryStore();
+    const clock = { t: 1_000_000 };
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: { authenticate: (n) => (n === 1 ? new Error('signin/complete 401') : undefined) },
+    });
+
+    await assert.rejects(() => session.getDevices());
+    assert.equal(session.isBackingOff, true);
+
+    session.setCredentials('someone@example.com', 'the-right-one');
+    assert.equal(session.isBackingOff, false, 'a corrected password is tried at once');
+
+    await session.getDevices();
+    assert.equal(client.calls.authenticate, 2);
+});
+
+test('re-setting the same credentials does not clear the backoff', async () => {
+    const store = memoryStore();
+    const clock = { t: 1_000_000 };
+    const { session } = makeSession({
+        store,
+        clock,
+        script: { authenticate: () => new Error('signin/complete 401') },
+    });
+
+    await assert.rejects(() => session.getDevices());
+
+    session.setCredentials('someone@example.com', 'hunter2');
+    assert.equal(session.isBackingOff, true, 'nothing changed, so nothing is reconsidered');
 });

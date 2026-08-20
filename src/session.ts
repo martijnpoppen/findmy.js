@@ -97,6 +97,13 @@ export class FindMySession {
     private username: string;
     private password: string;
     private findmy: FindMy | null = null;
+    private credentialsUnproven = false;
+    /**
+     * Last trust token seen for this account. Held on the session rather than
+     * read off the stored file, because a forced sign-in has no stored file to
+     * read and would otherwise present itself to Apple as a brand new browser.
+     */
+    private trustToken: string | null = null;
 
     private health: SessionHealth = {
         errorCount: 0,
@@ -144,8 +151,24 @@ export class FindMySession {
     }
 
     setCredentials(username: string, password: string): void {
+        if (username === this.username && password === this.password) return;
+
         this.username = username;
         this.password = password;
+
+        // New credentials are new information. An account that was waiting
+        // out a rejected password should not keep waiting on the old one.
+        this.health.errorCount = 0;
+        this.health.reauths = 0;
+        this.health.nextAttemptAt = 0;
+        this.health.lastError = null;
+
+        // A stored session that still works would otherwise let a wrong
+        // password pair successfully and fail later. Drop the live one too,
+        // or the next call would just keep using it. The trust token is kept:
+        // it identifies the client, not the password.
+        this.credentialsUnproven = true;
+        this.findmy = null;
     }
 
     termsUpdateNeeded(): boolean {
@@ -153,35 +176,34 @@ export class FindMySession {
     }
 
     /**
-     * Restore the stored session if iCloud still accepts it, and only sign in
-     * when it does not. A transient failure while checking raises
-     * RetryLaterError rather than falling through to a sign-in — falling
-     * through is what turns a flaky connection into a stream of login alerts.
+     * Restore the stored session, and sign in only when there is nothing to
+     * restore. Whether iCloud still accepts it is answered by the first real
+     * call rather than by a pre-flight, so a restore never costs a request and
+     * never produces a false negative worth an Apple login alert.
      */
     async connect({ forceLogin = false } = {}): Promise<void> {
         const findmy = this.createClient();
-        const stored = forceLogin ? null : await this.loadStored();
+        const skipStored = forceLogin || this.credentialsUnproven;
+        const stored = skipStored ? null : await this.loadStored();
 
         if (stored) {
             try {
                 findmy.importSession(stored);
+                this.trustToken = stored.trustToken || this.trustToken;
 
-                if (await findmy.validateSession()) {
-                    this.log('findmy: reused stored session, no sign-in needed');
+                const ageHours = Math.round((this.now() - stored.createdAt) / 3_600_000);
+                this.log(`findmy: reusing the stored session (${ageHours}h old), no sign-in needed`);
 
-                    this.findmy = findmy;
-                    this.markConnected();
-                    await this.persist({ force: true });
+                // Deliberately not pre-flighted. Asking a second endpoint
+                // whether the session works risks a false negative that costs
+                // a sign-in and an Apple login alert, and the first real call
+                // answers the same question for free: a rejected session comes
+                // back 401/421/450 and getDevices() signs in and retries.
+                this.findmy = findmy;
+                this.markConnected();
 
-                    return;
-                }
-
-                this.log('findmy: iCloud rejected the stored session');
+                return;
             } catch (error) {
-                if (isTransientNetworkError(error)) {
-                    throw this.noteTransient(error, 'validate');
-                }
-
                 this.log('findmy: stored session unusable', (error as Error).message);
             }
         }
@@ -203,7 +225,7 @@ export class FindMySession {
             await findmy.authenticate(
                 this.username,
                 this.password,
-                stored?.trustToken
+                this.trustToken ?? undefined
             );
         } catch (error) {
             this.findmy = null;
@@ -216,6 +238,8 @@ export class FindMySession {
         }
 
         this.findmy = findmy;
+        this.trustToken = findmy.getTrustToken() || this.trustToken;
+        this.credentialsUnproven = false;
         this.markConnected();
         await this.persist({ force: true });
     }
@@ -276,7 +300,10 @@ export class FindMySession {
                     );
                 }
 
-                this.log('findmy: session rejected by iCloud, signing in again');
+                this.log(
+                    'findmy: session rejected by iCloud, signing in again',
+                    this.health.lastError
+                );
 
                 await this.connect({ forceLogin: true });
             }
