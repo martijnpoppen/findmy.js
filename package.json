@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc",
     "format": "prettier --write .",
-    "test": "tsc && node --test test/session.test.mjs"
+    "test": "tsc && node --test \"test/*.test.mjs\""
   },
   "type": "module",
   "devDependencies": {

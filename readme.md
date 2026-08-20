@@ -54,6 +54,46 @@ async function main() {
 main();
 ```
 
+## Long-running use
+
+Every `authenticate()` call creates a new iCloud web session, and Apple emails
+the account holder a login alert for each one. Anything that polls on a timer
+should use `FindMySession`, which reuses a stored session instead of signing in,
+tells an expired session apart from a flaky network, and paces sign-ins so a bad
+connection cannot turn into a stream of alerts.
+
+```javascript
+import { FindMySession, RetryLaterError } from 'findmy.js';
+import { readFileSync, writeFileSync, unlinkSync } from 'fs';
+
+const session = new FindMySession({
+  key: 'my-apple-id',
+  username: 'someone@example.com',
+  password: 'hunter2',
+  // Where the session is kept between runs. Treat the contents as a password.
+  store: {
+    load: (key) => JSON.parse(readFileSync(`./${key}.json`, 'utf8')),
+    save: (key, data) => writeFileSync(`./${key}.json`, JSON.stringify(data)),
+    clear: (key) => unlinkSync(`./${key}.json`),
+  },
+});
+
+try {
+  const devices = await session.getDevices();
+} catch (error) {
+  if (error instanceof RetryLaterError) {
+    // iCloud could not be reached, or the session was just replaced. The
+    // session is still good; skip this round and try again after
+    // error.nextAttemptAt. Do not sign in again here.
+  } else {
+    throw error;
+  }
+}
+```
+
+A `load` that throws is treated as "nothing stored". Without a `store` the
+session still works, it just cannot survive a restart.
+
 ## Credits
 
 Thanks to [Foxt](https://github.com/foxt) for most of the implementation of the Apple login system.
