@@ -25,15 +25,37 @@ type SerializedCookieJar = ReturnType<CookieJar['toJSON']>;
  * iCloud web session and Apple alerts the account holder about it, so the
  * session has to outlive the process that made it.
  */
+/**
+ * Backoff state, stored with the session. Keeping it only in memory meant a
+ * restart started from zero and bought an immediate sign-in, however deep the
+ * backoff had got.
+ */
+export interface PersistedHealth {
+    reauths: number;
+    nextAttemptAt: number;
+    signinFailures: number;
+    lockedUntil: number;
+    lastError: string | null;
+}
+
 export interface SerializedSession {
     version: number;
-    cookies: SerializedCookieJar;
-    accountInfo: iCloudAccountInfo;
+    /** Null once iCloud has rejected the cookies; the tokens below outlive them. */
+    cookies: SerializedCookieJar | null;
+    accountInfo: iCloudAccountInfo | null;
     trustToken: string;
     /** Lets a restored session mint fresh cookies without a sign-in. */
     sessionToken: string;
     accountCountry: string;
     createdAt: number;
+    health?: PersistedHealth;
+}
+
+/** The parts of a session that survive the cookies being rejected. */
+export interface SessionTokens {
+    sessionToken: string;
+    trustToken?: string;
+    accountCountry?: string;
 }
 
 export class FindMy {
@@ -136,6 +158,30 @@ export class FindMy {
      * Returns false when Apple refuses the token, which is the only case where
      * a real sign-in is warranted.
      */
+    /**
+     * Build a session from tokens alone, with no cookies to start from. This
+     * is what lets a restart recover after iCloud rejected the last set of
+     * cookies: the token still mints new ones, and it costs no login alert.
+     */
+    async renewFromTokens(tokens: SessionTokens): Promise<boolean> {
+        if (!tokens?.sessionToken) return false;
+
+        const renewed = await RenewFindMySession({
+            cookies: new CookieJar(),
+            accountInfo: {} as iCloudAccountInfo,
+            trustToken: tokens.trustToken ?? '',
+            sessionToken: tokens.sessionToken,
+            accountCountry: tokens.accountCountry ?? '',
+        });
+
+        if (!renewed) return false;
+
+        this.authenticatedData = renewed;
+        this.sessionCreatedAt = Date.now();
+
+        return true;
+    }
+
     async renewWithToken(): Promise<boolean> {
         if (!this.authenticatedData?.sessionToken) return false;
 

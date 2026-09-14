@@ -1,6 +1,15 @@
 import { FindMyDevice } from './device.js';
-import { isAuthenticationError, isTransientNetworkError } from './errors.js';
-import { FindMy, SerializedSession } from './findmy.js';
+import {
+    AccountLockedError,
+    isAuthenticationError,
+    isTransientNetworkError,
+} from './errors.js';
+import {
+    FindMy,
+    PersistedHealth,
+    SerializedSession,
+    SESSION_FORMAT_VERSION,
+} from './findmy.js';
 
 /**
  * Where a session is kept between runs. The library does not care whether
@@ -34,6 +43,23 @@ export const DEFAULT_BACKOFF: BackoffConfig = {
 
 export const DEFAULT_SESSION_SAVE_INTERVAL = 30 * 60 * 1000;
 
+/**
+ * How many times signing in may fail to produce a session iCloud accepts
+ * before the account is treated as locked. Apple throttles an account that is
+ * signed into too often, and past that point every further sign-in extends the
+ * lockout instead of fixing it.
+ */
+export const DEFAULT_LOCKOUT_THRESHOLD = 3;
+
+/**
+ * Only backoffs at least this long are written to disk. Below it a restart
+ * losing the wait is harmless; above it, losing the wait means a sign-in.
+ */
+const PERSIST_BACKOFF_ABOVE = 5 * 60 * 1000;
+
+/** How long to leave a locked account alone before probing it once more. */
+export const DEFAULT_LOCKOUT_COOLDOWN = 6 * 60 * 60 * 1000;
+
 const pick = (schedule: number[], attempt: number): number => {
     if (schedule.length === 0) return 0;
     const index = Math.min(Math.max(attempt, 0), schedule.length - 1);
@@ -65,6 +91,8 @@ export interface FindMySessionOptions {
     store?: SessionStore;
     backoff?: Partial<BackoffConfig>;
     sessionSaveInterval?: number;
+    lockoutThreshold?: number;
+    lockoutCooldown?: number;
     logger?: (...args: unknown[]) => void;
     /** Injectable clock, for tests. */
     now?: () => number;
@@ -78,6 +106,10 @@ interface SessionHealth {
     nextAttemptAt: number;
     lastSessionSave: number;
     lastError: string | null;
+    /** Sign-ins that produced a session iCloud then rejected anyway. */
+    signinFailures: number;
+    /** While in the future, no sign-in is attempted at all. */
+    lockedUntil: number;
 }
 
 /**
@@ -90,6 +122,8 @@ export class FindMySession {
     private readonly store: SessionStore | null;
     private readonly backoff: BackoffConfig;
     private readonly sessionSaveInterval: number;
+    private readonly lockoutThreshold: number;
+    private readonly lockoutCooldown: number;
     private readonly log: (...args: unknown[]) => void;
     private readonly now: () => number;
     private readonly createClient: () => FindMy;
@@ -104,6 +138,14 @@ export class FindMySession {
      * read and would otherwise present itself to Apple as a brand new browser.
      */
     private trustToken: string | null = null;
+    /**
+     * Kept alongside the trust token and deliberately NOT discarded when
+     * iCloud rejects the cookies. These are what allow a silent recovery;
+     * throwing them away leaves a full sign-in as the only way back.
+     */
+    private sessionToken: string | null = null;
+    private accountCountry: string | null = null;
+    private healthLoaded = false;
 
     private health: SessionHealth = {
         errorCount: 0,
@@ -111,6 +153,8 @@ export class FindMySession {
         nextAttemptAt: 0,
         lastSessionSave: 0,
         lastError: null,
+        signinFailures: 0,
+        lockedUntil: 0,
     };
 
     constructor(options: FindMySessionOptions) {
@@ -124,6 +168,10 @@ export class FindMySession {
         };
         this.sessionSaveInterval =
             options.sessionSaveInterval ?? DEFAULT_SESSION_SAVE_INTERVAL;
+        this.lockoutThreshold =
+            options.lockoutThreshold ?? DEFAULT_LOCKOUT_THRESHOLD;
+        this.lockoutCooldown =
+            options.lockoutCooldown ?? DEFAULT_LOCKOUT_COOLDOWN;
         this.log = options.logger ?? (() => {});
         this.now = options.now ?? (() => Date.now());
         this.createClient = options.createClient ?? (() => new FindMy());
@@ -162,6 +210,12 @@ export class FindMySession {
         this.health.reauths = 0;
         this.health.nextAttemptAt = 0;
         this.health.lastError = null;
+        this.health.signinFailures = 0;
+        this.health.lockedUntil = 0;
+
+        // This reset is authoritative from here on: without it the next
+        // connect would read the old backoff straight back off disk.
+        this.healthLoaded = true;
 
         // A stored session that still works would otherwise let a wrong
         // password pair successfully and fail later. Drop the live one too,
@@ -182,23 +236,31 @@ export class FindMySession {
      * never produces a false negative worth an Apple login alert.
      */
     async connect({ forceLogin = false } = {}): Promise<void> {
+        const stored = await this.loadStored();
+
+        // Adopt the stored backoff before anything else. Without this a
+        // restart starts from zero and signs in immediately, however deep the
+        // backoff had got before the process died.
+        this.adoptStored(stored);
+        this.assertNotLockedOut();
+
         const findmy = this.createClient();
-        const skipStored = forceLogin || this.credentialsUnproven;
-        const stored = skipStored ? null : await this.loadStored();
+        const fresh = forceLogin || this.credentialsUnproven;
+        const usable =
+            !fresh && stored && stored.cookies && stored.accountInfo?.webservices;
 
-        if (stored) {
+        if (usable) {
             try {
-                findmy.importSession(stored);
-                this.trustToken = stored.trustToken || this.trustToken;
+                findmy.importSession(stored as SerializedSession);
 
-                const ageHours = Math.round((this.now() - stored.createdAt) / 3_600_000);
+                const ageHours = Math.round((this.now() - stored!.createdAt) / 3_600_000);
                 this.log(`findmy: reusing the stored session (${ageHours}h old), no sign-in needed`);
 
                 // Deliberately not pre-flighted. Asking a second endpoint
                 // whether the session works risks a false negative that costs
                 // a sign-in and an Apple login alert, and the first real call
                 // answers the same question for free: a rejected session comes
-                // back 401/421/450 and getDevices() signs in and retries.
+                // back 401/421/450 and getDevices() recovers from there.
                 this.findmy = findmy;
                 this.markConnected();
 
@@ -208,7 +270,49 @@ export class FindMySession {
             }
         }
 
-        await this.clearStored();
+        // The cookies are gone but the token they were minted from may still
+        // be good. Replaying it rebuilds the session without touching idmsa,
+        // so it costs no login alert — always worth trying before signing in.
+        if (!fresh && this.sessionToken) {
+            let rebuilt = false;
+
+            try {
+                rebuilt = await findmy.renewFromTokens({
+                    sessionToken: this.sessionToken,
+                    trustToken: this.trustToken ?? '',
+                    accountCountry: this.accountCountry ?? '',
+                });
+            } catch (error) {
+                if (isTransientNetworkError(error)) {
+                    throw this.noteTransient(error, 'renew');
+                }
+
+                this.log('findmy: could not rebuild from the stored token', describe(error));
+            }
+
+            if (rebuilt) {
+                this.log('findmy: session rebuilt from the stored token, no sign-in needed');
+
+                this.findmy = findmy;
+                this.captureTokens();
+                this.markConnected();
+                await this.persist({ force: true });
+
+                return;
+            }
+
+            this.log('findmy: the stored token was refused, a sign-in is needed');
+        }
+
+        // Everything cheap has been tried. A sign-in is the expensive option,
+        // so it answers to the backoff we just restored from disk.
+        if (this.isBackingOff) {
+            throw new RetryLaterError(
+                'Waiting before signing in again',
+                this.health.nextAttemptAt,
+                this.health.lastError
+            );
+        }
 
         // Counted here because this is the only place a sign-in happens, and
         // the count is what paces them.
@@ -234,22 +338,22 @@ export class FindMySession {
                 throw this.noteTransient(error, 'signin');
             }
 
-            throw this.noteReauth(error, 'signin');
+            const failure = this.noteReauth(error, 'signin');
+            await this.persist({ force: true });
+
+            throw failure;
         }
 
         this.findmy = findmy;
-        this.trustToken = findmy.getTrustToken() || this.trustToken;
+        this.captureTokens();
         this.credentialsUnproven = false;
         this.markConnected();
         await this.persist({ force: true });
     }
 
-    /**
-     * Fetch the account's devices, connecting or reconnecting as needed.
-     * Raises RetryLaterError when the caller should skip this round instead
-     * of trying harder.
-     */
     async getDevices(shouldLocate = true): Promise<Array<FindMyDevice>> {
+        this.assertNotLockedOut();
+
         if (this.isBackingOff) {
             throw new RetryLaterError(
                 'Still backing off',
@@ -309,19 +413,42 @@ export class FindMySession {
                     this.log('findmy: the stored token was refused, a sign-in is needed');
                 }
 
+                // Drop the dead cookies but KEEP the tokens: they are the
+                // only way back that does not cost a login alert, and
+                // deleting them is what turned one bad night into a sign-in
+                // on every restart.
                 this.findmy = null;
-                await this.clearStored();
+
+                if (this.health.reauths > 0) {
+                    // We signed in and iCloud rejected the result anyway.
+                    // Enough of those in a row means the account is throttled,
+                    // and more sign-ins will only keep it that way.
+                    this.health.signinFailures = this.health.signinFailures + 1;
+                }
+
+                const locked = this.armLockoutIfExhausted();
 
                 // A session that has been serving fine may simply have aged
                 // out, so the first rejection buys an immediate sign-in. A
                 // rejection right after one does not: that is iCloud refusing
                 // a brand new session, and signing in again only produces
                 // another login alert.
-                const wait = pick(this.backoff.reauth, this.health.reauths);
+                const wait = locked
+                    ? 0
+                    : pick(this.backoff.reauth, this.health.reauths);
 
                 if (wait > 0) {
                     this.health.nextAttemptAt = this.now() + wait;
+                }
 
+                // Written only now that the wait is on the clock. Persisting
+                // before this stored a zero, and the next process read that
+                // zero as "go ahead and sign in".
+                await this.persist({ force: true });
+
+                if (locked) throw locked;
+
+                if (wait > 0) {
                     throw new RetryLaterError(
                         'Session rejected; waiting before signing in again',
                         this.health.nextAttemptAt,
@@ -353,6 +480,99 @@ export class FindMySession {
 
     // ---------------- internals ----------------
 
+    /**
+     * Take the stored tokens and backoff onto this object. Called on every
+     * connect so a freshly constructed session (a restart) inherits where the
+     * previous process had got to instead of starting clean.
+     */
+    private adoptStored(stored: SerializedSession | null): void {
+        if (!stored) return;
+
+        this.trustToken = stored.trustToken || this.trustToken;
+        this.sessionToken = stored.sessionToken || this.sessionToken;
+        this.accountCountry = stored.accountCountry || this.accountCountry;
+
+        if (!stored.health || this.healthLoaded) return;
+
+        this.healthLoaded = true;
+
+        this.health.reauths = stored.health.reauths ?? 0;
+        this.health.nextAttemptAt = stored.health.nextAttemptAt ?? 0;
+        this.health.signinFailures = stored.health.signinFailures ?? 0;
+        this.health.lockedUntil = stored.health.lockedUntil ?? 0;
+        this.health.lastError = stored.health.lastError ?? null;
+
+        if (this.isBackingOff) {
+            const seconds = Math.round((this.health.nextAttemptAt - this.now()) / 1000);
+            this.log(`findmy: resuming the stored backoff, ${seconds}s left`);
+        }
+    }
+
+    private captureTokens(): void {
+        if (!this.findmy) return;
+
+        const session = this.findmy.exportSession();
+
+        if (!session) return;
+
+        this.trustToken = session.trustToken || this.trustToken;
+        this.sessionToken = session.sessionToken || this.sessionToken;
+        this.accountCountry = session.accountCountry || this.accountCountry;
+    }
+
+    private snapshotHealth(): PersistedHealth {
+        return {
+            reauths: this.health.reauths,
+            nextAttemptAt: this.health.nextAttemptAt,
+            signinFailures: this.health.signinFailures,
+            lockedUntil: this.health.lockedUntil,
+            lastError: this.health.lastError,
+        };
+    }
+
+    private assertNotLockedOut(): void {
+        if (this.health.lockedUntil <= this.now()) return;
+
+        throw new AccountLockedError(
+            'Apple is refusing new sessions for this account. Sign in at ' +
+            'https://icloud.com/find to clear it; signing in from here again ' +
+            'would only extend the lockout.',
+            this.health.lockedUntil
+        );
+    }
+
+    /** Arms the breaker once sign-ins have stopped helping. */
+    private armLockoutIfExhausted(): AccountLockedError | null {
+        if (this.health.signinFailures < this.lockoutThreshold) return null;
+
+        this.health.lockedUntil = this.now() + this.lockoutCooldown;
+        this.health.nextAttemptAt = this.health.lockedUntil;
+
+        const hours = Math.round(this.lockoutCooldown / 3_600_000);
+        this.log(
+            `findmy: ${this.health.signinFailures} sign-ins in a row produced a ` +
+            `session iCloud rejected. Treating the account as locked and ` +
+            `leaving it alone for ${hours}h.`
+        );
+
+        try {
+            this.assertNotLockedOut();
+        } catch (error) {
+            return error as AccountLockedError;
+        }
+
+        return null;
+    }
+
+    /** True while the breaker is holding sign-ins off. */
+    get isLockedOut(): boolean {
+        return this.health.lockedUntil > this.now();
+    }
+
+    get lockedUntil(): number {
+        return this.health.lockedUntil;
+    }
+
     /** Connected, but not yet proven to actually serve data. */
     private markConnected(): void {
         this.health.errorCount = 0;
@@ -368,6 +588,8 @@ export class FindMySession {
     private markHealthy(): void {
         this.markConnected();
         this.health.reauths = 0;
+        this.health.signinFailures = 0;
+        this.health.lockedUntil = 0;
     }
 
     private noteTransient(error: unknown, phase: string): RetryLaterError {
@@ -381,6 +603,13 @@ export class FindMySession {
             this.health.lastError,
             `retrying in ${Math.round((this.health.nextAttemptAt - this.now()) / 1000)}s`
         );
+
+        // Only once the wait is long enough to matter. A minute lost to a
+        // restart costs nothing, but an hour-deep outage backoff that resets
+        // to zero is how a restart turns into a sign-in.
+        if (this.health.nextAttemptAt - this.now() >= PERSIST_BACKOFF_ABOVE) {
+            void this.persist({ force: true });
+        }
 
         return new RetryLaterError(
             this.health.lastError,
@@ -413,13 +642,13 @@ export class FindMySession {
     }
 
     private async persist({ force = false } = {}): Promise<boolean> {
-        if (!this.store || !this.findmy) return false;
+        if (!this.store) return false;
 
         if (!force && this.now() - this.health.lastSessionSave < this.sessionSaveInterval) {
             return false;
         }
 
-        const session = this.findmy.exportSession();
+        const session = this.buildRecord();
 
         if (!session) return false;
 
@@ -433,6 +662,32 @@ export class FindMySession {
 
             return false;
         }
+    }
+
+    /**
+     * The record to write. With a live session that is the session itself;
+     * without one it is still worth writing, because the tokens and the
+     * backoff are exactly what the next process needs in order not to sign in.
+     */
+    private buildRecord(): SerializedSession | null {
+        const live = this.findmy?.exportSession() ?? null;
+
+        if (live) return { ...live, health: this.snapshotHealth() };
+
+        if (!this.sessionToken && !this.trustToken && !this.health.nextAttemptAt) {
+            return null;
+        }
+
+        return {
+            version: SESSION_FORMAT_VERSION,
+            cookies: null,
+            accountInfo: null,
+            trustToken: this.trustToken ?? '',
+            sessionToken: this.sessionToken ?? '',
+            accountCountry: this.accountCountry ?? '',
+            createdAt: this.now(),
+            health: this.snapshotHealth(),
+        };
     }
 
     private async clearStored(): Promise<void> {

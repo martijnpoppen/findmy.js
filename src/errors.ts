@@ -64,6 +64,22 @@ export class UnauthenticatedError extends Error {
     }
 }
 
+/**
+ * Thrown when signing in has repeatedly failed to produce a session iCloud
+ * will accept. Apple throttles an account that is signed into too often, and
+ * once that happens every further sign-in extends the lockout — so the only
+ * useful move is to stop and tell the account holder.
+ */
+export class AccountLockedError extends Error {
+    readonly until: number;
+
+    constructor(message: string, until: number) {
+        super(message);
+        this.name = 'AccountLockedError';
+        this.until = until;
+    }
+}
+
 /** Thrown when a stored session was restored but iCloud no longer accepts it. */
 export class SessionExpiredError extends Error {
     constructor(message = 'Stored session is no longer valid') {

@@ -94,6 +94,19 @@ try {
 A `load` that throws is treated as "nothing stored". Without a `store` the
 session still works, it just cannot survive a restart.
 
+The stored record carries the backoff as well as the session, so a restart
+picks up where the last process left off instead of signing in immediately.
+When iCloud rejects the cookies the tokens are kept, not deleted — they are
+what lets the next start recover without a sign-in.
+
+If signing in repeatedly produces a session iCloud rejects anyway, the account
+is being throttled and further sign-ins only prolong it. After
+`lockoutThreshold` (default 3) such rounds, `getDevices()` throws
+`AccountLockedError` instead, carrying `until`; it lifts by itself after
+`lockoutCooldown` (default 6h) for a single probe, and clears the moment a
+call succeeds or new credentials arrive. Show the account holder its message —
+the only real fix is for them to sign in at icloud.com/find.
+
 Find My answers `450` when it wants the session re-established. That is not a
 request to sign in again: `FindMySession` replays the stored session token
 against `accountLogin`, which mints fresh cookies without touching `idmsa` and

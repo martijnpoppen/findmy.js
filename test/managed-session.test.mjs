@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    AccountLockedError,
     DEFAULT_BACKOFF,
+    DEFAULT_LOCKOUT_COOLDOWN,
+    DEFAULT_LOCKOUT_THRESHOLD,
     FindMySession,
     ICloudRequestError,
     RetryLaterError,
@@ -41,7 +44,7 @@ function memoryStore(initial = {}) {
 
 /** Scriptable stand-in for the FindMy client. */
 function fakeClient(script = {}) {
-    const calls = { authenticate: 0, validate: 0, getDevices: 0, renew: 0 };
+    const calls = { authenticate: 0, validate: 0, getDevices: 0, renew: 0, rebuild: 0 };
     let authenticated = false;
 
     return {
@@ -51,6 +54,12 @@ function fakeClient(script = {}) {
         deauthenticate() { authenticated = false; },
         termsUpdateNeeded: () => false,
         getTrustToken: () => 'fresh-token',
+        async renewFromTokens() {
+            calls.rebuild += 1;
+            const outcome = script.rebuild?.(calls.rebuild);
+            if (outcome instanceof Error) throw outcome;
+            return outcome ?? false;
+        },
         async renewWithToken() {
             calls.renew += 1;
             const outcome = script.renew?.(calls.renew);
@@ -196,7 +205,7 @@ test('a rejected session signs in again once, immediately', async () => {
     assert.deepEqual(devices, [{ id: 'device-1' }]);
 });
 
-test('a session rejected right after signing in does not sign in again', async () => {
+test('sign-ins stop once they stop helping', async () => {
     const store = memoryStore({ 'account-key': storedSession() });
     const clock = { t: 1_000_000 };
     const { session, client } = makeSession({
@@ -206,46 +215,30 @@ test('a session rejected right after signing in does not sign in again', async (
     });
 
     // The stored session is rejected, so one immediate sign-in is warranted.
-    // iCloud rejects that brand new session too, and that is where it stops.
+    // iCloud rejects that brand new session too.
     const first = await session.getDevices().catch((e) => e);
 
     assert.ok(first instanceof RetryLaterError);
     assert.equal(client.calls.authenticate, 1, 'exactly one sign-in, not two');
     assert.equal(first.nextAttemptAt - clock.t, 300_000);
 
-    const waits = [];
-    for (let i = 0; i < 4; i++) {
-        clock.t = session.nextAttemptAt;
-        const error = await session.getDevices().catch((e) => e);
-        waits.push(error.nextAttemptAt - clock.t);
-    }
+    // Each further round costs one more sign-in, spaced further apart.
+    clock.t = session.nextAttemptAt;
+    const second = await session.getDevices().catch((e) => e);
 
-    assert.deepEqual(waits, [900_000, 1_800_000, 3_600_000, 3_600_000]);
-    assert.equal(client.calls.authenticate, 5);
-});
+    assert.ok(second instanceof RetryLaterError);
+    assert.equal(client.calls.authenticate, 2);
+    assert.equal(second.nextAttemptAt - clock.t, 900_000);
 
-test('a permanently broken account is capped at one sign-in an hour', async () => {
-    const store = memoryStore({ 'account-key': storedSession() });
-    const clock = { t: 0 };
-    const { session, client } = makeSession({
-        store,
-        clock,
-        script: { getDevices: () => new ICloudRequestError('x', 450, '') },
-    });
+    // The third is the last: signing in is clearly not what is wrong, so the
+    // breaker stops rather than keep extending Apple's lockout.
+    clock.t = session.nextAttemptAt;
+    const third = await session.getDevices().catch((e) => e);
 
-    // Six hours of a 60s poll loop against an account iCloud keeps rejecting.
-    const SIX_HOURS = 6 * 60 * 60 * 1000;
-    while (clock.t < SIX_HOURS) {
-        await session.getDevices().catch(() => {});
-        clock.t += 60_000;
-    }
-
-    // Sign-ins land at 0, 5m, 20m, 50m, then hourly: 9 over six hours. The
-    // old loop signed in every ~5 minutes, which is ~72 Apple login alerts.
-    assert.ok(
-        client.calls.authenticate <= 10,
-        `expected at most 10 sign-ins in six hours, got ${client.calls.authenticate}`
-    );
+    assert.ok(third instanceof AccountLockedError, 'the breaker trips');
+    assert.equal(client.calls.authenticate, DEFAULT_LOCKOUT_THRESHOLD);
+    assert.equal(session.isLockedOut, true);
+    assert.equal(third.until - clock.t, DEFAULT_LOCKOUT_COOLDOWN);
 });
 
 test('a call made while backing off is refused without touching the network', async () => {
@@ -485,4 +478,201 @@ test('two days of 450s cost no sign-ins at all when the token still works', asyn
 
     assert.equal(client.calls.authenticate, 0, 'zero login alerts across two days');
     assert.ok(client.calls.renew > 100, 'recovered by renewing throughout');
+});
+
+// ---------------------------------------------------------------------------
+// Restarts. A Homey restarts its apps on crash, update and reboot - which is
+// exactly what happens during an internet outage. Every test above uses one
+// long-lived object, so none of them covered this.
+// ---------------------------------------------------------------------------
+
+/** A new process: same store, same clock, brand new session object. */
+function restart(store, clock, script = {}) {
+    return makeSession({ store, clock, script });
+}
+
+test('a restart mid-backoff does not buy a free sign-in', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+
+    const first = makeSession({
+        store,
+        clock,
+        script: { getDevices: () => new ICloudRequestError('x', 450, '') },
+    });
+
+    await assert.rejects(() => first.session.getDevices(), RetryLaterError);
+    assert.equal(first.client.calls.authenticate, 1);
+    assert.ok(first.session.nextAttemptAt > clock.t, 'backing off');
+
+    // The app restarts one minute later, still inside the backoff window.
+    clock.t += 60_000;
+    const second = restart(store, clock, { getDevices: () => new ICloudRequestError('x', 450, '') });
+
+    const error = await second.session.getDevices().catch((e) => e);
+
+    assert.ok(error instanceof RetryLaterError, 'the new process picks the backoff up');
+    assert.equal(second.client.calls.authenticate, 0, 'and signs in exactly zero times');
+});
+
+test('an auth failure keeps the tokens so a restart can recover silently', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+
+    const first = makeSession({
+        store,
+        clock,
+        script: { getDevices: () => new ICloudRequestError('x', 450, '') },
+    });
+
+    await assert.rejects(() => first.session.getDevices(), RetryLaterError);
+
+    // The record must still be there, and must still carry the token.
+    const kept = store.data.get('account-key');
+
+    assert.ok(kept, 'the stored record was not deleted');
+    assert.equal(kept.sessionToken, 'ds-web-auth-token', 'the token survived');
+    assert.equal(kept.trustToken, 'trust-me', 'so did the trust token');
+    assert.equal(kept.cookies, null, 'only the dead cookies were dropped');
+
+    // After the backoff, a restart rebuilds from that token instead of
+    // signing in - this is the path that used to hit ENOENT.
+    clock.t = first.session.nextAttemptAt;
+    const second = restart(store, clock, { rebuild: () => true });
+
+    const devices = await second.session.getDevices();
+
+    assert.equal(second.client.calls.rebuild, 1, 'rebuilt from the stored token');
+    assert.equal(second.client.calls.authenticate, 0, 'with no sign-in and no login alert');
+    assert.deepEqual(devices, [{ id: 'device-1' }]);
+});
+
+test('the breaker survives a restart', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    let current = makeSession({ store, clock, script: reject });
+
+    // Drive it to the lockout.
+    for (let i = 0; i < DEFAULT_LOCKOUT_THRESHOLD; i++) {
+        clock.t = Math.max(clock.t, current.session.nextAttemptAt);
+        await current.session.getDevices().catch(() => {});
+    }
+    assert.equal(current.session.isLockedOut, true);
+
+    // A restart must not shrug the lockout off.
+    clock.t += 60_000;
+    const after = restart(store, clock, reject);
+    const error = await after.session.getDevices().catch((e) => e);
+
+    assert.ok(error instanceof AccountLockedError, 'still locked in the new process');
+    assert.equal(after.client.calls.authenticate, 0, 'no sign-in attempted');
+    assert.match(error.message, /icloud\.com\/find/, 'and it says what to do about it');
+});
+
+test('the breaker releases after the cooldown and re-arms if still broken', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    const { session, client } = makeSession({ store, clock, script: reject });
+
+    for (let i = 0; i < DEFAULT_LOCKOUT_THRESHOLD; i++) {
+        clock.t = Math.max(clock.t, session.nextAttemptAt);
+        await session.getDevices().catch(() => {});
+    }
+
+    const signInsBefore = client.calls.authenticate;
+    assert.equal(session.isLockedOut, true);
+
+    // Once the cooldown expires the account gets exactly one more probe.
+    clock.t = session.lockedUntil;
+    assert.equal(session.isLockedOut, false, 'the lock lifts on its own');
+
+    await session.getDevices().catch(() => {});
+
+    assert.equal(client.calls.authenticate, signInsBefore + 1, 'one probe, not a burst');
+    assert.equal(session.isLockedOut, true, 're-armed immediately when it failed again');
+});
+
+test('a locked account recovers the moment iCloud accepts it again', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    let broken = true;
+
+    const { session } = makeSession({
+        store,
+        clock,
+        script: { getDevices: () => (broken ? new ICloudRequestError('x', 450, '') : undefined) },
+    });
+
+    for (let i = 0; i < DEFAULT_LOCKOUT_THRESHOLD; i++) {
+        clock.t = Math.max(clock.t, session.nextAttemptAt);
+        await session.getDevices().catch(() => {});
+    }
+    assert.equal(session.isLockedOut, true);
+
+    broken = false;
+    clock.t = session.lockedUntil;
+
+    await session.getDevices();
+
+    assert.equal(session.isLockedOut, false);
+    assert.equal(session.nextAttemptAt, 0, 'fully healthy again');
+});
+
+test('the reported scenario: an outage plus a restart every 10 minutes', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    let signIns = 0;
+
+    // iCloud rejects every session, the way it does for a throttled account.
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    const DAY = 24 * 60 * 60 * 1000;
+    let current = makeSession({ store, clock, script: reject });
+
+    while (clock.t < DAY) {
+        // A poll every 2 minutes, and a restart every 10.
+        for (let i = 0; i < 5 && clock.t < DAY; i++) {
+            await current.session.getDevices().catch(() => {});
+            clock.t += 120_000;
+        }
+
+        signIns += current.client.calls.authenticate;
+        current = restart(store, clock, reject);
+    }
+
+    signIns += current.client.calls.authenticate;
+
+    // Before this change every restart signed in: 144 restarts, 144 alerts.
+    console.log(`  → ${signIns} sign-ins across a day of 2min polls and 10min restarts`);
+    assert.ok(signIns <= 6, `expected at most 6 sign-ins in a day, got ${signIns}`);
+});
+
+test('a deep outage backoff survives a restart', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    const outage = { getDevices: () => dnsError() };
+
+    const first = makeSession({ store, clock, script: outage });
+
+    // Ride the transient ladder up past the five-minute mark.
+    for (let i = 0; i < 4; i++) {
+        clock.t = Math.max(clock.t, first.session.nextAttemptAt);
+        await first.session.getDevices().catch(() => {});
+    }
+
+    const waitLeft = first.session.nextAttemptAt - clock.t;
+    assert.ok(waitLeft >= 300_000, 'a meaningful backoff is in place');
+
+    // The outage takes the Homey with it and the app comes back up.
+    clock.t += 30_000;
+    const second = restart(store, clock, outage);
+    const error = await second.session.getDevices().catch((e) => e);
+
+    assert.ok(error instanceof RetryLaterError);
+    assert.equal(second.client.calls.authenticate, 0, 'a restart mid-outage signs in zero times');
+    assert.ok(second.session.nextAttemptAt > clock.t, 'and keeps waiting');
 });
