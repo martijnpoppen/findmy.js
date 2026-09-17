@@ -1,1 +1,23 @@
-export { FindMy } from './findmy.js';
+export { FindMy, SESSION_FORMAT_VERSION } from './findmy.js';
+export type { PersistedHealth, SerializedSession, SessionTokens } from './findmy.js';
+export {
+    DEFAULT_BACKOFF,
+    DEFAULT_LOCKOUT_COOLDOWN,
+    DEFAULT_LOCKOUT_THRESHOLD,
+    DEFAULT_SESSION_SAVE_INTERVAL,
+    FindMySession,
+    RetryLaterError,
+} from './session.js';
+export type {
+    BackoffConfig,
+    FindMySessionOptions,
+    SessionStore,
+} from './session.js';
+export {
+    AccountLockedError,
+    ICloudRequestError,
+    SessionExpiredError,
+    UnauthenticatedError,
+    isAuthenticationError,
+    isTransientNetworkError,
+} from './errors.js';
