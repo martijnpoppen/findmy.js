@@ -420,7 +420,14 @@ export class FindMySession {
                     }
 
                     if (ok) {
-                        this.log('findmy: session renewed from the stored token, no sign-in needed');
+                        // The status is in the line because the cadence of
+                        // these renewals is the only way to tell a session
+                        // that aged out from one iCloud never accepted, and a
+                        // bare "renewed" line answered neither.
+                        this.log(
+                            'findmy: session renewed from the stored token, ' +
+                            `no sign-in needed (${this.health.lastError})`
+                        );
 
                         this.markConnected();
                         await this.persist({ force: true });
