@@ -34,6 +34,7 @@ export interface PersistedHealth {
     reauths: number;
     nextAttemptAt: number;
     signinFailures: number;
+    lockouts?: number;
     lockedUntil: number;
     lastError: string | null;
 }

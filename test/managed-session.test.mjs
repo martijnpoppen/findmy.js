@@ -5,6 +5,7 @@ import {
     AccountLockedError,
     DEFAULT_BACKOFF,
     DEFAULT_LOCKOUT_COOLDOWN,
+    DEFAULT_LOCKOUT_COOLDOWNS,
     DEFAULT_LOCKOUT_THRESHOLD,
     FindMySession,
     ICloudRequestError,
@@ -568,7 +569,8 @@ test('the breaker survives a restart', async () => {
 
     assert.ok(error instanceof AccountLockedError, 'still locked in the new process');
     assert.equal(after.client.calls.authenticate, 0, 'no sign-in attempted');
-    assert.match(error.message, /icloud\.com\/find/, 'and it says what to do about it');
+    assert.match(error.message, /icloud\.com/, 'it names the check');
+    assert.match(error.message, /[Rr]eset your Apple Account password/, 'and the actual remedy');
 });
 
 test('the breaker releases after the cooldown and re-arms if still broken', async () => {
@@ -675,4 +677,116 @@ test('a deep outage backoff survives a restart', async () => {
     assert.ok(error instanceof RetryLaterError);
     assert.equal(second.client.calls.authenticate, 0, 'a restart mid-outage signs in zero times');
     assert.ok(second.session.nextAttemptAt > clock.t, 'and keeps waiting');
+});
+
+test('each lockout waits longer than the last', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    const { session, client } = makeSession({ store, clock, script: reject });
+
+    const cooldowns = [];
+
+    for (let round = 0; round < DEFAULT_LOCKOUT_COOLDOWNS.length + 1; round++) {
+        // Drive to the next lockout, however many sign-ins that takes.
+        while (!session.isLockedOut) {
+            clock.t = Math.max(clock.t, session.nextAttemptAt);
+            await session.getDevices().catch(() => {});
+        }
+
+        cooldowns.push(session.lockedUntil - clock.t);
+        clock.t = session.lockedUntil;
+    }
+
+    const expected = [...DEFAULT_LOCKOUT_COOLDOWNS, DEFAULT_LOCKOUT_COOLDOWNS.at(-1)];
+
+    assert.deepEqual(cooldowns, expected, 'widens, then holds at the longest');
+    // Four lockouts, and the sign-ins that earned the first one.
+    assert.ok(client.calls.authenticate <= 6, `got ${client.calls.authenticate} sign-ins`);
+});
+
+test('a blocked account costs about one sign-in a day once it settles', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    const { session, client } = makeSession({ store, clock, script: reject });
+
+    const WEEK = 7 * 24 * 60 * 60 * 1000;
+
+    while (clock.t < WEEK) {
+        await session.getDevices().catch(() => {});
+        clock.t += 120_000;
+    }
+
+    // Flat 6h cooldowns would be 28 over a week; the 1.8.0 hourly ladder, 168.
+    console.log(`  → ${client.calls.authenticate} sign-ins across a blocked week`);
+    assert.ok(
+        client.calls.authenticate <= 11,
+        `expected about one a day, got ${client.calls.authenticate}`
+    );
+});
+
+test('a recovery resets the ladder, so a later block starts gently again', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    let broken = true;
+
+    const { session } = makeSession({
+        store,
+        clock,
+        script: { getDevices: () => (broken ? new ICloudRequestError('x', 450, '') : undefined) },
+    });
+
+    while (!session.isLockedOut) {
+        clock.t = Math.max(clock.t, session.nextAttemptAt);
+        await session.getDevices().catch(() => {});
+    }
+    clock.t = session.lockedUntil;
+
+    broken = false;
+    await session.getDevices();
+    assert.equal(session.isLockedOut, false);
+
+    broken = true;
+    while (!session.isLockedOut) {
+        clock.t = Math.max(clock.t, session.nextAttemptAt);
+        await session.getDevices().catch(() => {});
+    }
+
+    assert.equal(
+        session.lockedUntil - clock.t,
+        DEFAULT_LOCKOUT_COOLDOWNS[0],
+        'back to the first rung, not still at the longest'
+    );
+});
+
+test('the lockout ladder survives a restart', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 0 };
+    const reject = { getDevices: () => new ICloudRequestError('x', 450, '') };
+
+    let current = makeSession({ store, clock, script: reject });
+
+    while (!current.session.isLockedOut) {
+        clock.t = Math.max(clock.t, current.session.nextAttemptAt);
+        await current.session.getDevices().catch(() => {});
+    }
+    assert.equal(current.session.lockedUntil - clock.t, DEFAULT_LOCKOUT_COOLDOWNS[0]);
+
+    // Restart, wait out the first cooldown, fail again.
+    clock.t = current.session.lockedUntil;
+    current = restart(store, clock, reject);
+
+    while (!current.session.isLockedOut) {
+        clock.t = Math.max(clock.t, current.session.nextAttemptAt);
+        await current.session.getDevices().catch(() => {});
+    }
+
+    assert.equal(
+        current.session.lockedUntil - clock.t,
+        DEFAULT_LOCKOUT_COOLDOWNS[1],
+        'the new process knows this is the second lockout, not the first'
+    );
 });

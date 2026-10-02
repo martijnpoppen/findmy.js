@@ -57,8 +57,21 @@ export const DEFAULT_LOCKOUT_THRESHOLD = 3;
  */
 const PERSIST_BACKOFF_ABOVE = 5 * 60 * 1000;
 
-/** How long to leave a locked account alone before probing it once more. */
-export const DEFAULT_LOCKOUT_COOLDOWN = 6 * 60 * 60 * 1000;
+/**
+ * How long to leave a locked account alone before probing it once more, per
+ * lockout. Each probe is a sign-in, so each probe is another Apple email to
+ * the account holder — and a block does not reliably clear on its own, it
+ * takes a password reset. So the gaps widen instead of staying at six hours
+ * forever: a user who has not acted yet gets one mail a day, not four.
+ */
+export const DEFAULT_LOCKOUT_COOLDOWNS = [
+    6 * 60 * 60 * 1000,
+    12 * 60 * 60 * 1000,
+    24 * 60 * 60 * 1000,
+];
+
+/** @deprecated Use DEFAULT_LOCKOUT_COOLDOWNS. Kept for existing callers. */
+export const DEFAULT_LOCKOUT_COOLDOWN = DEFAULT_LOCKOUT_COOLDOWNS[0] as number;
 
 const pick = (schedule: number[], attempt: number): number => {
     if (schedule.length === 0) return 0;
@@ -92,7 +105,8 @@ export interface FindMySessionOptions {
     backoff?: Partial<BackoffConfig>;
     sessionSaveInterval?: number;
     lockoutThreshold?: number;
-    lockoutCooldown?: number;
+    /** One wait, or a widening ladder of them indexed by lockout count. */
+    lockoutCooldown?: number | number[];
     logger?: (...args: unknown[]) => void;
     /** Injectable clock, for tests. */
     now?: () => number;
@@ -108,6 +122,8 @@ interface SessionHealth {
     lastError: string | null;
     /** Sign-ins that produced a session iCloud then rejected anyway. */
     signinFailures: number;
+    /** How many times the breaker has tripped without a success since. */
+    lockouts: number;
     /** While in the future, no sign-in is attempted at all. */
     lockedUntil: number;
 }
@@ -123,7 +139,7 @@ export class FindMySession {
     private readonly backoff: BackoffConfig;
     private readonly sessionSaveInterval: number;
     private readonly lockoutThreshold: number;
-    private readonly lockoutCooldown: number;
+    private readonly lockoutCooldowns: number[];
     private readonly log: (...args: unknown[]) => void;
     private readonly now: () => number;
     private readonly createClient: () => FindMy;
@@ -154,6 +170,7 @@ export class FindMySession {
         lastSessionSave: 0,
         lastError: null,
         signinFailures: 0,
+        lockouts: 0,
         lockedUntil: 0,
     };
 
@@ -170,8 +187,8 @@ export class FindMySession {
             options.sessionSaveInterval ?? DEFAULT_SESSION_SAVE_INTERVAL;
         this.lockoutThreshold =
             options.lockoutThreshold ?? DEFAULT_LOCKOUT_THRESHOLD;
-        this.lockoutCooldown =
-            options.lockoutCooldown ?? DEFAULT_LOCKOUT_COOLDOWN;
+        const cooldown = options.lockoutCooldown ?? DEFAULT_LOCKOUT_COOLDOWNS;
+        this.lockoutCooldowns = Array.isArray(cooldown) ? cooldown : [cooldown];
         this.log = options.logger ?? (() => {});
         this.now = options.now ?? (() => Date.now());
         this.createClient = options.createClient ?? (() => new FindMy());
@@ -211,6 +228,7 @@ export class FindMySession {
         this.health.nextAttemptAt = 0;
         this.health.lastError = null;
         this.health.signinFailures = 0;
+        this.health.lockouts = 0;
         this.health.lockedUntil = 0;
 
         // This reset is authoritative from here on: without it the next
@@ -402,7 +420,14 @@ export class FindMySession {
                     }
 
                     if (ok) {
-                        this.log('findmy: session renewed from the stored token, no sign-in needed');
+                        // The status is in the line because the cadence of
+                        // these renewals is the only way to tell a session
+                        // that aged out from one iCloud never accepted, and a
+                        // bare "renewed" line answered neither.
+                        this.log(
+                            'findmy: session renewed from the stored token, ' +
+                            `no sign-in needed (${this.health.lastError})`
+                        );
 
                         this.markConnected();
                         await this.persist({ force: true });
@@ -499,6 +524,7 @@ export class FindMySession {
         this.health.reauths = stored.health.reauths ?? 0;
         this.health.nextAttemptAt = stored.health.nextAttemptAt ?? 0;
         this.health.signinFailures = stored.health.signinFailures ?? 0;
+        this.health.lockouts = stored.health.lockouts ?? 0;
         this.health.lockedUntil = stored.health.lockedUntil ?? 0;
         this.health.lastError = stored.health.lastError ?? null;
 
@@ -525,6 +551,7 @@ export class FindMySession {
             reauths: this.health.reauths,
             nextAttemptAt: this.health.nextAttemptAt,
             signinFailures: this.health.signinFailures,
+            lockouts: this.health.lockouts,
             lockedUntil: this.health.lockedUntil,
             lastError: this.health.lastError,
         };
@@ -534,9 +561,16 @@ export class FindMySession {
         if (this.health.lockedUntil <= this.now()) return;
 
         throw new AccountLockedError(
-            'Apple is refusing new sessions for this account. Sign in at ' +
-            'https://icloud.com/find to clear it; signing in from here again ' +
-            'would only extend the lockout.',
+            // Apple sends no notice that an account is blocked, and the
+            // obvious check - signing in on the website - is refused too, so
+            // say that outright: a user told only to "sign in at icloud.com"
+            // tries it, fails, and learns nothing.
+            'Apple has blocked sign-ins for this Apple Account. Open ' +
+            'https://icloud.com to check: if it refuses you there as well, ' +
+            'the block is confirmed. Reset your Apple Account password, then ' +
+            'confirm the recent sign-in attempts were yours. This app has ' +
+            'stopped trying so it cannot prolong the block, and will recover ' +
+            'on its own once Apple accepts the account again.',
             this.health.lockedUntil
         );
     }
@@ -545,10 +579,13 @@ export class FindMySession {
     private armLockoutIfExhausted(): AccountLockedError | null {
         if (this.health.signinFailures < this.lockoutThreshold) return null;
 
-        this.health.lockedUntil = this.now() + this.lockoutCooldown;
+        const cooldown = pick(this.lockoutCooldowns, this.health.lockouts);
+
+        this.health.lockouts = this.health.lockouts + 1;
+        this.health.lockedUntil = this.now() + cooldown;
         this.health.nextAttemptAt = this.health.lockedUntil;
 
-        const hours = Math.round(this.lockoutCooldown / 3_600_000);
+        const hours = Math.round(cooldown / 3_600_000);
         this.log(
             `findmy: ${this.health.signinFailures} sign-ins in a row produced a ` +
             `session iCloud rejected. Treating the account as locked and ` +
@@ -589,6 +626,7 @@ export class FindMySession {
         this.markConnected();
         this.health.reauths = 0;
         this.health.signinFailures = 0;
+        this.health.lockouts = 0;
         this.health.lockedUntil = 0;
     }
 
