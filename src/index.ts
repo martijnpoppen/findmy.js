@@ -3,6 +3,7 @@ export type { PersistedHealth, SerializedSession, SessionTokens } from './findmy
 export {
     DEFAULT_BACKOFF,
     DEFAULT_LOCKOUT_COOLDOWN,
+    DEFAULT_LOCKOUT_COOLDOWNS,
     DEFAULT_LOCKOUT_THRESHOLD,
     DEFAULT_SESSION_SAVE_INTERVAL,
     FindMySession,
