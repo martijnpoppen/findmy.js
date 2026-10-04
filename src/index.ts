@@ -6,6 +6,7 @@ export {
     DEFAULT_LOCKOUT_COOLDOWNS,
     DEFAULT_LOCKOUT_THRESHOLD,
     DEFAULT_SESSION_SAVE_INTERVAL,
+    DEFAULT_SIGNIN_PROOF_WINDOW,
     FindMySession,
     RetryLaterError,
 } from './session.js';

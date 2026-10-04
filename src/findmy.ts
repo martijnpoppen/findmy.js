@@ -37,6 +37,12 @@ export interface PersistedHealth {
     lockouts?: number;
     lockedUntil: number;
     lastError: string | null;
+    /**
+     * When the last sign-in happened. Persisted because the pacing of
+     * sign-ins has to survive a restart, and because a counter that a single
+     * successful call resets cannot pace anything.
+     */
+    lastSigninAt?: number;
 }
 
 export interface SerializedSession {
