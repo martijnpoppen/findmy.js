@@ -790,3 +790,49 @@ test('the lockout ladder survives a restart', async () => {
         'the new process knows this is the second lockout, not the first'
     );
 });
+
+test('reusing a stored session reports how long Apple says the cookies last', async () => {
+    const clock = { t: 1_000_000 };
+    const expiring = {
+        ...storedSession(),
+        createdAt: clock.t - 3 * 60_000,
+        cookies: {
+            version: 'tough-cookie@4',
+            storeType: 'MemoryCookieStore',
+            cookies: [
+                { key: 'X-APPLE-WEBAUTH-USER', value: 'u', domain: 'icloud.com', path: '/' },
+                {
+                    key: 'X-APPLE-WEBAUTH-TOKEN',
+                    value: 't',
+                    domain: 'icloud.com',
+                    path: '/',
+                    expires: new Date(clock.t + 27 * 60_000).toISOString(),
+                },
+            ],
+        },
+    };
+
+    const lines = [];
+    const store = memoryStore({ 'account-key': expiring });
+    const { session } = makeSession({ store, clock, logger: (...args) => lines.push(args.join(' ')) });
+
+    await session.connect();
+
+    const reuse = lines.find((line) => line.includes('reusing the stored session'));
+
+    assert.ok(reuse, 'the reuse line should be logged');
+    assert.match(reuse, /3m old/);
+    assert.match(reuse, /web-auth cookies good for another 27m/);
+});
+
+test('a session whose cookies carry no expiry says so rather than guessing', async () => {
+    const lines = [];
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session } = makeSession({ store, logger: (...args) => lines.push(args.join(' ')) });
+
+    await session.connect();
+
+    const reuse = lines.find((line) => line.includes('reusing the stored session'));
+
+    assert.match(reuse, /web-auth cookies carry no expiry/);
+});

@@ -278,7 +278,7 @@ export class FindMySession {
                 // and one that has been serving quietly for a while.
                 this.log(
                     `findmy: reusing the stored session (${describeAge(this.now() - stored!.createdAt)} old), ` +
-                    'no sign-in needed'
+                    `no sign-in needed - ${describeCookieLifetime(stored!.cookies, this.now())}`
                 );
 
                 // Deliberately not pre-flighted. Asking a second endpoint
@@ -319,6 +319,7 @@ export class FindMySession {
                 this.log('findmy: session rebuilt from the stored token, no sign-in needed');
 
                 this.findmy = findmy;
+                this.logCookieLifetime();
                 this.captureTokens();
                 this.markConnected();
                 await this.persist({ force: true });
@@ -373,6 +374,7 @@ export class FindMySession {
         this.captureTokens();
         this.credentialsUnproven = false;
         this.markConnected();
+        this.logCookieLifetime();
         await this.persist({ force: true });
     }
 
@@ -435,6 +437,8 @@ export class FindMySession {
                             'findmy: session renewed from the stored token, ' +
                             `no sign-in needed (${this.health.lastError})`
                         );
+
+                        this.logCookieLifetime();
 
                         this.markConnected();
                         await this.persist({ force: true });
@@ -618,6 +622,19 @@ export class FindMySession {
     }
 
     /** Connected, but not yet proven to actually serve data. */
+    /**
+     * Printed after anything that mints a new web session, so a single field
+     * log shows both how often we renew and how long Apple intends the
+     * result to last.
+     */
+    private logCookieLifetime(): void {
+        const live = this.findmy?.exportSession();
+
+        if (!live) return;
+
+        this.log(`findmy: ${describeCookieLifetime(live.cookies, this.now())}`);
+    }
+
     private markConnected(): void {
         this.health.errorCount = 0;
         this.health.nextAttemptAt = 0;
@@ -748,6 +765,32 @@ export class FindMySession {
 
 const describe = (error: unknown): string =>
     (error instanceof Error && error.message) || String(error);
+
+/**
+ * How long Apple says the session cookies are still good for. This is the
+ * number that decides everything about the login notifications: a renewal
+ * costs a fresh web session, `extended_login: true` is supposed to buy two
+ * weeks of them, and a reading of half an hour means Apple is not granting
+ * it - in which case a renewal every half hour is unavoidable and no amount
+ * of caching on our side will help.
+ */
+const describeCookieLifetime = (
+    cookies: SerializedSession['cookies'],
+    now: number
+): string => {
+    const expiries = ((cookies?.cookies ?? []) as Array<Record<string, unknown>>)
+        .filter((cookie) => /WEBAUTH/i.test(String(cookie['key'])))
+        .map((cookie) => Date.parse(String(cookie['expires'])))
+        .filter((at) => Number.isFinite(at));
+
+    if (!expiries.length) return 'web-auth cookies carry no expiry';
+
+    const soonest = Math.min(...expiries);
+
+    return soonest <= now
+        ? 'web-auth cookies have already expired'
+        : `web-auth cookies good for another ${describeAge(soonest - now)}`;
+};
 
 const describeAge = (ms: number): string => {
     const minutes = Math.round(ms / 60_000);
