@@ -790,3 +790,154 @@ test('the lockout ladder survives a restart', async () => {
         'the new process knows this is the second lockout, not the first'
     );
 });
+
+test('reusing a stored session reports how long Apple says the cookies last', async () => {
+    const clock = { t: 1_000_000 };
+    const expiring = {
+        ...storedSession(),
+        createdAt: clock.t - 3 * 60_000,
+        cookies: {
+            version: 'tough-cookie@4',
+            storeType: 'MemoryCookieStore',
+            cookies: [
+                { key: 'X-APPLE-WEBAUTH-USER', value: 'u', domain: 'icloud.com', path: '/' },
+                {
+                    key: 'X-APPLE-WEBAUTH-TOKEN',
+                    value: 't',
+                    domain: 'icloud.com',
+                    path: '/',
+                    expires: new Date(clock.t + 27 * 60_000).toISOString(),
+                },
+            ],
+        },
+    };
+
+    const lines = [];
+    const store = memoryStore({ 'account-key': expiring });
+    const { session } = makeSession({ store, clock, logger: (...args) => lines.push(args.join(' ')) });
+
+    await session.connect();
+
+    const reuse = lines.find((line) => line.includes('reusing the stored session'));
+
+    assert.ok(reuse, 'the reuse line should be logged');
+    assert.match(reuse, /3m old/);
+    assert.match(reuse, /web-auth cookies good for another 27m/);
+});
+
+test('a session whose cookies carry no expiry says so rather than guessing', async () => {
+    const lines = [];
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session } = makeSession({ store, logger: (...args) => lines.push(args.join(' ')) });
+
+    await session.connect();
+
+    const reuse = lines.find((line) => line.includes('reusing the stored session'));
+
+    assert.match(reuse, /web-auth cookies carry no expiry/);
+});
+
+test('a session that serves one call and is then rejected does not buy a sign-in every poll', async () => {
+    // The reported shape: Apple issues a session, answers exactly one request
+    // with it, and rejects the next. The account is not blocked - signing in
+    // works every time - so every poll used to end in a fresh sign-in, and
+    // every sign-in in an Apple login alert for the account holder.
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    let served = 0;
+
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: {
+            getDevices: () => {
+                if (served >= 1) return new ICloudRequestError('x', 450, '');
+                served += 1;
+                return [{ id: 'device-1' }];
+            },
+            authenticate: () => { served = 0; },
+        },
+    });
+
+    const POLL = 15 * 60 * 1000;
+
+    for (let i = 0; i < (24 * 60) / 15; i++) {
+        await session.getDevices().catch(() => {});
+        clock.t += POLL;
+    }
+
+    assert.ok(
+        client.calls.authenticate <= 8,
+        `one sign-in per poll would be 96; got ${client.calls.authenticate}`
+    );
+});
+
+test('one call right after a sign-in does not clear the sign-in history', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    let served = 0;
+
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: {
+            getDevices: () => {
+                if (served >= 1) return new ICloudRequestError('x', 450, '');
+                served += 1;
+                return [{ id: 'device-1' }];
+            },
+            authenticate: () => { served = 0; },
+        },
+    });
+
+    // Poll one is served by the stored session. Poll two is rejected and buys
+    // the one immediate sign-in it is entitled to, which then serves a call.
+    for (let i = 0; i < 3; i++) {
+        await session.getDevices().catch(() => {});
+        clock.t += 15 * 60 * 1000;
+    }
+
+    assert.equal(client.calls.authenticate, 1, 'one sign-in so far');
+
+    // Poll three was rejected again. That has to be spaced out: if the served
+    // call after the sign-in had cleared the counters, the ladder would be
+    // back on its first rung - an immediate sign-in - on every poll.
+    assert.ok(
+        session.nextAttemptAt > clock.t - 15 * 60 * 1000,
+        'the next sign-in is scheduled, not immediate'
+    );
+});
+
+test('a session that holds up past the proof window earns a clean slate', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    let rejectOnce = true;
+
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: {
+            getDevices: () => {
+                if (rejectOnce) { rejectOnce = false; return new ICloudRequestError('x', 450, ''); }
+                return [{ id: 'device-1' }];
+            },
+        },
+    });
+
+    // One rejection buys one sign-in, and this session keeps working.
+    await session.getDevices();
+    assert.equal(client.calls.authenticate, 1);
+
+    // Well past the proof window, so this session has proven itself and the
+    // history is cleared.
+    clock.t += 2 * 60 * 60 * 1000;
+    await session.getDevices();
+    assert.equal(session.isBackingOff, false, 'a proven session is not left backing off');
+
+    // Which means a later rejection is once again allowed its immediate
+    // sign-in, rather than being paced as though the last one had just failed.
+    rejectOnce = true;
+    await session.getDevices();
+
+    assert.equal(client.calls.authenticate, 2, 'the clean slate restores the immediate retry');
+});

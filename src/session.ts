@@ -49,6 +49,13 @@ export const DEFAULT_SESSION_SAVE_INTERVAL = 30 * 60 * 1000;
  * signed into too often, and past that point every further sign-in extends the
  * lockout instead of fixing it.
  */
+/**
+ * How long a freshly signed-in session has to keep working before it counts
+ * as proven. Inside this window one served call proves nothing: iCloud will
+ * hand out a session, answer a single request with it and reject the next.
+ */
+export const DEFAULT_SIGNIN_PROOF_WINDOW = 30 * 60 * 1000;
+
 export const DEFAULT_LOCKOUT_THRESHOLD = 3;
 
 /**
@@ -105,6 +112,8 @@ export interface FindMySessionOptions {
     backoff?: Partial<BackoffConfig>;
     sessionSaveInterval?: number;
     lockoutThreshold?: number;
+    /** How long a new session must hold up before it counts as proven. */
+    signinProofWindow?: number;
     /** One wait, or a widening ladder of them indexed by lockout count. */
     lockoutCooldown?: number | number[];
     logger?: (...args: unknown[]) => void;
@@ -116,6 +125,8 @@ export interface FindMySessionOptions {
 
 interface SessionHealth {
     errorCount: number;
+    /** When the last sign-in happened, or null when there has not been one. */
+    lastSigninAt: number | null;
     reauths: number;
     nextAttemptAt: number;
     lastSessionSave: number;
@@ -139,6 +150,7 @@ export class FindMySession {
     private readonly backoff: BackoffConfig;
     private readonly sessionSaveInterval: number;
     private readonly lockoutThreshold: number;
+    private readonly signinProofWindow: number;
     private readonly lockoutCooldowns: number[];
     private readonly log: (...args: unknown[]) => void;
     private readonly now: () => number;
@@ -165,6 +177,7 @@ export class FindMySession {
 
     private health: SessionHealth = {
         errorCount: 0,
+        lastSigninAt: null,
         reauths: 0,
         nextAttemptAt: 0,
         lastSessionSave: 0,
@@ -187,6 +200,8 @@ export class FindMySession {
             options.sessionSaveInterval ?? DEFAULT_SESSION_SAVE_INTERVAL;
         this.lockoutThreshold =
             options.lockoutThreshold ?? DEFAULT_LOCKOUT_THRESHOLD;
+        this.signinProofWindow =
+            options.signinProofWindow ?? DEFAULT_SIGNIN_PROOF_WINDOW;
         const cooldown = options.lockoutCooldown ?? DEFAULT_LOCKOUT_COOLDOWNS;
         this.lockoutCooldowns = Array.isArray(cooldown) ? cooldown : [cooldown];
         this.log = options.logger ?? (() => {});
@@ -230,6 +245,9 @@ export class FindMySession {
         this.health.signinFailures = 0;
         this.health.lockouts = 0;
         this.health.lockedUntil = 0;
+        // Including the floor: someone who has just retyped their password is
+        // waiting at the pairing screen for it to be tried.
+        this.health.lastSigninAt = null;
 
         // This reset is authoritative from here on: without it the next
         // connect would read the old backoff straight back off disk.
@@ -271,8 +289,15 @@ export class FindMySession {
             try {
                 findmy.importSession(stored as SerializedSession);
 
-                const ageHours = Math.round((this.now() - stored!.createdAt) / 3_600_000);
-                this.log(`findmy: reusing the stored session (${ageHours}h old), no sign-in needed`);
+                // In minutes under the hour. Rounded to hours this printed
+                // "0h old" for anything from one minute to half an hour,
+                // which is the difference between a session that was just
+                // minted - so something had authenticated moments earlier -
+                // and one that has been serving quietly for a while.
+                this.log(
+                    `findmy: reusing the stored session (${describeAge(this.now() - stored!.createdAt)} old), ` +
+                    `no sign-in needed - ${describeCookieLifetime(stored!.cookies, this.now())}`
+                );
 
                 // Deliberately not pre-flighted. Asking a second endpoint
                 // whether the session works risks a false negative that costs
@@ -312,6 +337,7 @@ export class FindMySession {
                 this.log('findmy: session rebuilt from the stored token, no sign-in needed');
 
                 this.findmy = findmy;
+                this.logCookieLifetime();
                 this.captureTokens();
                 this.markConnected();
                 await this.persist({ force: true });
@@ -362,10 +388,12 @@ export class FindMySession {
             throw failure;
         }
 
+        this.health.lastSigninAt = this.now();
         this.findmy = findmy;
         this.captureTokens();
         this.credentialsUnproven = false;
         this.markConnected();
+        this.logCookieLifetime();
         await this.persist({ force: true });
     }
 
@@ -429,6 +457,8 @@ export class FindMySession {
                             `no sign-in needed (${this.health.lastError})`
                         );
 
+                        this.logCookieLifetime();
+
                         this.markConnected();
                         await this.persist({ force: true });
 
@@ -444,10 +474,13 @@ export class FindMySession {
                 // on every restart.
                 this.findmy = null;
 
-                if (this.health.reauths > 0) {
+                if (this.stillProvingItself) {
                     // We signed in and iCloud rejected the result anyway.
-                    // Enough of those in a row means the account is throttled,
-                    // and more sign-ins will only keep it that way.
+                    // Enough of those in a row means signing in is not what
+                    // this account needs, and more of them only cost the
+                    // holder another login alert each. Judged on when we last
+                    // signed in, not on a counter the success above may have
+                    // just cleared.
                     this.health.signinFailures = this.health.signinFailures + 1;
                 }
 
@@ -524,6 +557,7 @@ export class FindMySession {
         this.health.reauths = stored.health.reauths ?? 0;
         this.health.nextAttemptAt = stored.health.nextAttemptAt ?? 0;
         this.health.signinFailures = stored.health.signinFailures ?? 0;
+        this.health.lastSigninAt = stored.health.lastSigninAt ?? null;
         this.health.lockouts = stored.health.lockouts ?? 0;
         this.health.lockedUntil = stored.health.lockedUntil ?? 0;
         this.health.lastError = stored.health.lastError ?? null;
@@ -551,6 +585,9 @@ export class FindMySession {
             reauths: this.health.reauths,
             nextAttemptAt: this.health.nextAttemptAt,
             signinFailures: this.health.signinFailures,
+            ...(this.health.lastSigninAt === null
+                ? {}
+                : { lastSigninAt: this.health.lastSigninAt }),
             lockouts: this.health.lockouts,
             lockedUntil: this.health.lockedUntil,
             lastError: this.health.lastError,
@@ -565,12 +602,14 @@ export class FindMySession {
             // obvious check - signing in on the website - is refused too, so
             // say that outright: a user told only to "sign in at icloud.com"
             // tries it, fails, and learns nothing.
-            'Apple has blocked sign-ins for this Apple Account. Open ' +
-            'https://icloud.com to check: if it refuses you there as well, ' +
-            'the block is confirmed. Reset your Apple Account password, then ' +
-            'confirm the recent sign-in attempts were yours. This app has ' +
-            'stopped trying so it cannot prolong the block, and will recover ' +
-            'on its own once Apple accepts the account again.',
+            'Signing in to this Apple Account keeps producing a session ' +
+            'Apple then refuses. Check https://icloud.com: if it will not ' +
+            'let you in either, reset your Apple Account password and then ' +
+            'confirm the recent sign-in attempts were yours. If the website ' +
+            'works fine, the account is healthy and this is Apple refusing ' +
+            'the app rather than you. Either way it has stopped trying for ' +
+            'now, so it cannot make things worse or keep sending you login ' +
+            'alerts, and it will pick up again on its own.',
             this.health.lockedUntil
         );
     }
@@ -611,6 +650,19 @@ export class FindMySession {
     }
 
     /** Connected, but not yet proven to actually serve data. */
+    /**
+     * Printed after anything that mints a new web session, so a single field
+     * log shows both how often we renew and how long Apple intends the
+     * result to last.
+     */
+    private logCookieLifetime(): void {
+        const live = this.findmy?.exportSession();
+
+        if (!live) return;
+
+        this.log(`findmy: ${describeCookieLifetime(live.cookies, this.now())}`);
+    }
+
     private markConnected(): void {
         this.health.errorCount = 0;
         this.health.nextAttemptAt = 0;
@@ -618,16 +670,43 @@ export class FindMySession {
     }
 
     /**
-     * A completed round trip. Only this clears the sign-in counter — clearing
-     * it on connect would let a session that is rejected immediately after
-     * every sign-in earn a fresh sign-in every round.
+     * A completed round trip.
+     *
+     * The sign-in history is only cleared once the session has actually held
+     * up for a while. Clearing it on any success looked right and was the
+     * whole bug: iCloud hands out a session, serves one call with it and
+     * rejects the next, so every poll ended with the counters back at zero,
+     * the ladder back at its first rung - which is an immediate sign-in - and
+     * the breaker unable to arm, because the failure it counts is guarded on
+     * those same counters. One sign-in, and one Apple login alert, per poll.
      */
     private markHealthy(): void {
         this.markConnected();
-        this.health.reauths = 0;
-        this.health.signinFailures = 0;
+
+        // A served call is proof that Apple is accepting this account, so the
+        // breaker lets go at once however recently we signed in. Holding a
+        // lockout while handing back live device data would only leave the
+        // devices marked unavailable for no reason.
         this.health.lockouts = 0;
         this.health.lockedUntil = 0;
+
+        // The sign-in history is what paces sign-ins, and it outlives a single
+        // success on purpose.
+        if (this.stillProvingItself) return;
+
+        this.health.reauths = 0;
+        this.health.signinFailures = 0;
+    }
+
+    /**
+     * True while the last sign-in is recent enough that one working call says
+     * nothing yet. A session that is still serving after this has earned a
+     * clean slate; one that fails inside the window has not.
+     */
+    private get stillProvingItself(): boolean {
+        const at = this.health.lastSigninAt;
+
+        return at !== null && this.now() - at < this.signinProofWindow;
     }
 
     private noteTransient(error: unknown, phase: string): RetryLaterError {
@@ -741,3 +820,35 @@ export class FindMySession {
 
 const describe = (error: unknown): string =>
     (error instanceof Error && error.message) || String(error);
+
+/**
+ * How long Apple says the session cookies are still good for. This is the
+ * number that decides everything about the login notifications: a renewal
+ * costs a fresh web session, `extended_login: true` is supposed to buy two
+ * weeks of them, and a reading of half an hour means Apple is not granting
+ * it - in which case a renewal every half hour is unavoidable and no amount
+ * of caching on our side will help.
+ */
+const describeCookieLifetime = (
+    cookies: SerializedSession['cookies'],
+    now: number
+): string => {
+    const expiries = ((cookies?.cookies ?? []) as Array<Record<string, unknown>>)
+        .filter((cookie) => /WEBAUTH/i.test(String(cookie['key'])))
+        .map((cookie) => Date.parse(String(cookie['expires'])))
+        .filter((at) => Number.isFinite(at));
+
+    if (!expiries.length) return 'web-auth cookies carry no expiry';
+
+    const soonest = Math.min(...expiries);
+
+    return soonest <= now
+        ? 'web-auth cookies have already expired'
+        : `web-auth cookies good for another ${describeAge(soonest - now)}`;
+};
+
+const describeAge = (ms: number): string => {
+    const minutes = Math.round(ms / 60_000);
+
+    return minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 60)}h`;
+};
