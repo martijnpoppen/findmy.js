@@ -941,3 +941,122 @@ test('a session that holds up past the proof window earns a clean slate', async 
 
     assert.equal(client.calls.authenticate, 2, 'the clean slate restores the immediate retry');
 });
+
+test('the keep-alive is free for a host that already polls often', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client, clock } = makeSession({ store });
+
+    await session.getDevices();
+
+    // Two minutes later, the way Dennis and Drako74 run it. The refresh
+    // itself kept the session warm, so there is nothing for the keep-alive
+    // to do and it must not spend a request finding that out.
+    clock.t += 2 * 60 * 1000;
+
+    assert.equal(await session.keepAlive(), false, 'nothing to do');
+    assert.equal(client.calls.validate, 0, 'and no request made to decide that');
+});
+
+test('the keep-alive touches a session the host has left idle', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client, clock } = makeSession({ store });
+
+    await session.getDevices();
+
+    clock.t += 6 * 60 * 1000;
+
+    assert.equal(await session.keepAlive(), true, 'the session is still good');
+    assert.equal(client.calls.validate, 1, 'one cheap round trip');
+    assert.equal(client.calls.authenticate, 0, 'and no sign-in, so no login alert');
+
+    // The touch counts, so the next one waits a full interval again.
+    clock.t += 2 * 60 * 1000;
+    await session.keepAlive();
+    assert.equal(client.calls.validate, 1, 'not touched again straight away');
+});
+
+test('a two-hour poll stops costing a renewal once the keep-alive runs', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const clock = { t: 1_000_000 };
+    let warm = true;
+
+    const { session, client } = makeSession({
+        store,
+        clock,
+        script: {
+            // iCloud drops a session left alone. Whatever is holding it warm
+            // - a refresh or a keep-alive - is what keeps this true.
+            validate: () => warm,
+            getDevices: () =>
+                warm ? [{ id: 'device-1' }] : new ICloudRequestError('x', 450, ''),
+            renew: () => { warm = true; return true; },
+        },
+    });
+
+    await session.connect();
+
+    // Michel's setup: twelve hours at a two-hour interval, with the keep-alive
+    // ticking in between. Each tick is inside the window Apple will hold a
+    // session for, so the session never dies and nothing has to be renewed.
+    for (let minute = 0; minute < 12 * 60; minute += 5) {
+        clock.t += 5 * 60 * 1000;
+
+        if (minute % 120 === 0) await session.getDevices();
+        else await session.keepAlive();
+
+        // Standing in for Apple letting go of an untouched session.
+        if (clock.t - session.lastTouch > 10 * 60 * 1000) warm = false;
+    }
+
+    assert.equal(client.calls.renew, 0, 'no renewals, so no Apple login alerts');
+    assert.equal(client.calls.authenticate, 0, 'and no sign-ins either');
+});
+
+test('the keep-alive renews a session it finds already dead', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client, clock } = makeSession({
+        store,
+        script: { validate: () => false, renew: () => true },
+    });
+
+    await session.getDevices();
+
+    clock.t += 6 * 60 * 1000;
+
+    assert.equal(await session.keepAlive(), true, 'back to a warm session');
+    assert.equal(client.calls.renew, 1, 'the token was replayed');
+    assert.equal(client.calls.authenticate, 0, 'which costs no sign-in');
+});
+
+test('the keep-alive never signs in, however badly it goes', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, client, clock } = makeSession({
+        store,
+        script: { validate: () => false, renew: () => false },
+    });
+
+    await session.getDevices();
+
+    clock.t += 6 * 60 * 1000;
+
+    // Apple refused the token. Signing in is what is needed, and the keep-alive
+    // is not allowed to be the one to do it: that call is paced and reported by
+    // the refresh path.
+    assert.equal(await session.keepAlive(), false);
+    assert.equal(client.calls.authenticate, 0, 'a timer does not get to sign in');
+});
+
+test('a keep-alive during an outage does not throw at the host', async () => {
+    const store = memoryStore({ 'account-key': storedSession() });
+    const { session, clock } = makeSession({
+        store,
+        script: { validate: () => dnsError() },
+    });
+
+    await session.getDevices();
+
+    clock.t += 6 * 60 * 1000;
+
+    await assert.doesNotReject(() => session.keepAlive());
+    assert.equal(session.isBackingOff, true, 'the outage still widens the backoff');
+});

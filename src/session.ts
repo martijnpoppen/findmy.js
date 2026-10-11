@@ -56,6 +56,19 @@ export const DEFAULT_SESSION_SAVE_INTERVAL = 30 * 60 * 1000;
  */
 export const DEFAULT_SIGNIN_PROOF_WINDOW = 30 * 60 * 1000;
 
+/**
+ * How long the session may go untouched before the keep-alive pings iCloud.
+ *
+ * Apple attaches no expiry to the web-auth cookies, so there is no documented
+ * lifetime to work from, but field reports put the real one somewhere between
+ * two and fifteen minutes of silence: accounts polled every two minutes never
+ * lose their session, accounts polled every two hours find it dead at every
+ * single poll. Five minutes sits under the low end of that range with room to
+ * spare, and is a fraction of the traffic those two-minute accounts already
+ * produce without upsetting Apple.
+ */
+export const DEFAULT_KEEPALIVE_INTERVAL = 5 * 60 * 1000;
+
 export const DEFAULT_LOCKOUT_THRESHOLD = 3;
 
 /**
@@ -114,6 +127,8 @@ export interface FindMySessionOptions {
     lockoutThreshold?: number;
     /** How long a new session must hold up before it counts as proven. */
     signinProofWindow?: number;
+    /** How long the session may idle before the keep-alive touches it. */
+    keepAliveInterval?: number;
     /** One wait, or a widening ladder of them indexed by lockout count. */
     lockoutCooldown?: number | number[];
     logger?: (...args: unknown[]) => void;
@@ -151,6 +166,7 @@ export class FindMySession {
     private readonly sessionSaveInterval: number;
     private readonly lockoutThreshold: number;
     private readonly signinProofWindow: number;
+    private readonly keepAliveInterval: number;
     private readonly lockoutCooldowns: number[];
     private readonly log: (...args: unknown[]) => void;
     private readonly now: () => number;
@@ -174,6 +190,12 @@ export class FindMySession {
     private sessionToken: string | null = null;
     private accountCountry: string | null = null;
     private healthLoaded = false;
+    /**
+     * When iCloud last answered anything at all. Deliberately not persisted:
+     * after a restart the session has been idle for an unknown stretch, and
+     * the safe assumption is that it needs touching.
+     */
+    private lastTouchAt = 0;
 
     private health: SessionHealth = {
         errorCount: 0,
@@ -202,6 +224,8 @@ export class FindMySession {
             options.lockoutThreshold ?? DEFAULT_LOCKOUT_THRESHOLD;
         this.signinProofWindow =
             options.signinProofWindow ?? DEFAULT_SIGNIN_PROOF_WINDOW;
+        this.keepAliveInterval =
+            options.keepAliveInterval ?? DEFAULT_KEEPALIVE_INTERVAL;
         const cooldown = options.lockoutCooldown ?? DEFAULT_LOCKOUT_COOLDOWNS;
         this.lockoutCooldowns = Array.isArray(cooldown) ? cooldown : [cooldown];
         this.log = options.logger ?? (() => {});
@@ -228,6 +252,11 @@ export class FindMySession {
 
     get lastError(): string | null {
         return this.health.lastError;
+    }
+
+    /** When iCloud last answered, so a host can pace its own keep-alive. */
+    get lastTouch(): number {
+        return this.lastTouchAt;
     }
 
     setCredentials(username: string, password: string): void {
@@ -315,7 +344,7 @@ export class FindMySession {
 
         // The cookies are gone but the token they were minted from may still
         // be good. Replaying it rebuilds the session without touching idmsa,
-        // so it costs no login alert — always worth trying before signing in.
+        // so it is far cheaper than signing in - always worth trying first.
         if (!fresh && this.sessionToken) {
             let rebuilt = false;
 
@@ -435,7 +464,10 @@ export class FindMySession {
                 // iCloud asking for the session to be re-established is not
                 // the same as asking the account to sign in. Replaying the
                 // token we already hold mints fresh cookies without touching
-                // idmsa, so it costs no login alert. Only once for this call.
+                // idmsa. Cheaper than signing in, but not free - renewing
+                // at every poll appears to mail the account holder at every
+                // poll, which is what keepAlive() is there to prevent. Only
+                // once for this call.
                 if (!renewed && this.findmy) {
                     renewed = true;
 
@@ -528,6 +560,79 @@ export class FindMySession {
     disconnect(): void {
         this.findmy?.deauthenticate();
         this.findmy = null;
+    }
+
+    /**
+     * Keep the session warm so iCloud never has to be asked for a new one.
+     *
+     * Letting the session go cold is what reaches the account holder as an
+     * Apple login alert: the cookies lapse after a stretch of silence, the
+     * next refresh comes back 450, and re-establishing the session is what
+     * Apple reports. Polling often enough avoids that by accident, which is
+     * why a two-minute interval is quiet and a two-hour one mails the user at
+     * every poll. This makes it deliberate instead, so how often the host
+     * polls stops deciding how much mail Apple sends.
+     *
+     * Free for hosts that already poll faster than the keep-alive interval: a
+     * served refresh counts as a touch, so there is nothing to do and no
+     * request goes out. Never signs in - avoiding that is the entire point -
+     * and never throws, because a missed keep-alive is not the caller's
+     * problem to report; the next real refresh will say so if it matters.
+     *
+     * Returns whether the session is known to be good right now.
+     */
+    async keepAlive(): Promise<boolean> {
+        if (!this.findmy) return false;
+        if (this.isLockedOut || this.isBackingOff) return false;
+        if (this.now() - this.lastTouchAt < this.keepAliveInterval) return false;
+
+        try {
+            if (await this.findmy.validateSession()) {
+                this.markConnected();
+
+                return true;
+            }
+        } catch (error) {
+            // Recorded through the usual backoff so an outage still widens the
+            // wait, but swallowed: see above.
+            this.noteTransient(error, 'keep-alive');
+
+            return false;
+        }
+
+        // The cookies are already gone, so this renewal costs what it would
+        // have cost at the next refresh anyway - and doing it here puts the
+        // session back in a state the keep-alive can hold, instead of leaving
+        // it dead and renewing it again at every poll from now on.
+        let renewed = false;
+
+        try {
+            renewed = await this.findmy.renewWithToken();
+        } catch (error) {
+            this.noteTransient(error, 'keep-alive renewal');
+
+            return false;
+        }
+
+        if (!renewed) {
+            // Apple refused the token, which is the one case that warrants a
+            // real sign-in. A keep-alive does not get to make that call: it is
+            // paced, counted and reported by getDevices(), and a timer quietly
+            // signing in behind the host is how this went wrong before.
+            this.log(
+                'findmy: the keep-alive found the stored token refused, ' +
+                'leaving the sign-in to the next refresh'
+            );
+
+            return false;
+        }
+
+        this.log('findmy: session renewed by the keep-alive, no sign-in needed');
+        this.logCookieLifetime();
+        this.markConnected();
+        await this.persist({ force: true });
+
+        return true;
     }
 
     /** Drop the session and forget it, so the next connect signs in. */
@@ -667,6 +772,10 @@ export class FindMySession {
         this.health.errorCount = 0;
         this.health.nextAttemptAt = 0;
         this.health.lastError = null;
+        // Every path here has just had an answer out of iCloud, which is what
+        // keeps the session warm. Recording it is what makes the keep-alive
+        // free for callers that already poll often.
+        this.lastTouchAt = this.now();
     }
 
     /**
