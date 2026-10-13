@@ -1012,7 +1012,7 @@ test('a two-hour poll stops costing a renewal once the keep-alive runs', async (
     assert.equal(client.calls.authenticate, 0, 'and no sign-ins either');
 });
 
-test('the keep-alive renews a session it finds already dead', async () => {
+test('the keep-alive never renews a session it finds already dead', async () => {
     const store = memoryStore({ 'account-key': storedSession() });
     const { session, client, clock } = makeSession({
         store,
@@ -1021,11 +1021,17 @@ test('the keep-alive renews a session it finds already dead', async () => {
 
     await session.getDevices();
 
-    clock.t += 6 * 60 * 1000;
+    // Twelve ticks against a session Apple has already dropped. Renewing even
+    // one of them would mail the account holder between their refreshes as
+    // well as at them, which is how this made a bad account much worse.
+    for (let tick = 0; tick < 12; tick += 1) {
+        clock.t += 6 * 60 * 1000;
 
-    assert.equal(await session.keepAlive(), true, 'back to a warm session');
-    assert.equal(client.calls.renew, 1, 'the token was replayed');
-    assert.equal(client.calls.authenticate, 0, 'which costs no sign-in');
+        assert.equal(await session.keepAlive(), false, 'nothing it can do');
+    }
+
+    assert.equal(client.calls.renew, 0, 'not one renewal, so not one alert');
+    assert.equal(client.calls.authenticate, 0, 'and no sign-in either');
 });
 
 test('the keep-alive never signs in, however badly it goes', async () => {
@@ -1061,46 +1067,3 @@ test('a keep-alive during an outage does not throw at the host', async () => {
     assert.equal(session.isBackingOff, true, 'the outage still widens the backoff');
 });
 
-test('the keep-alive will not renew twice without a refresh in between', async () => {
-    const store = memoryStore({ 'account-key': storedSession() });
-    const { session, client, clock } = makeSession({
-        store,
-        // A session that dies again the moment it is renewed. Renewing on
-        // every tick would mean a login alert every five minutes, which is
-        // worse than the polling this was meant to spare.
-        script: { validate: () => false, renew: () => true },
-    });
-
-    await session.getDevices();
-
-    for (let tick = 0; tick < 12; tick += 1) {
-        clock.t += 6 * 60 * 1000;
-        await session.keepAlive();
-    }
-
-    assert.equal(client.calls.renew, 1, 'one renewal, not one per tick');
-    assert.equal(client.calls.authenticate, 0, 'and still no sign-in');
-});
-
-test('a served refresh lets the keep-alive repair the session again', async () => {
-    const store = memoryStore({ 'account-key': storedSession() });
-    const { session, client, clock } = makeSession({
-        store,
-        script: { validate: () => false, renew: () => true },
-    });
-
-    await session.getDevices();
-
-    clock.t += 6 * 60 * 1000;
-    await session.keepAlive();
-    assert.equal(client.calls.renew, 1);
-
-    // The poll came round and iCloud served it, so the session is working and
-    // the keep-alive is trusted with it again.
-    await session.getDevices();
-
-    clock.t += 6 * 60 * 1000;
-    await session.keepAlive();
-
-    assert.equal(client.calls.renew, 2, 'the cap lifts once a refresh gets through');
-});
