@@ -293,7 +293,7 @@ export class FindMy {
             headers: headers,
             method: 'POST',
             body: request === null ? 'null' : JSON.stringify(request),
-            ...fetchOptions,
+            ...fetchOptions(),
         });
 
         if (!response.ok) {

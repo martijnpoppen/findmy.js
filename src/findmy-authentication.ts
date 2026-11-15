@@ -115,7 +115,7 @@ async function AuthInit(
         headers: AUTH_HEADERS,
         method: 'POST',
         body: JSON.stringify(initData),
-        ...fetchOptions,
+        ...fetchOptions(),
     });
 
     session.absorb(res);
@@ -150,7 +150,7 @@ async function AuthComplete(
             rememberMe: remembered,
             pause2FA: true,
         }),
-        ...fetchOptions,
+        ...fetchOptions(),
     });
 
     session.absorb(res);
@@ -191,7 +191,7 @@ async function AuthFinish(
         headers: DEFAULT_HEADERS,
         method: 'POST',
         body: JSON.stringify(data),
-        ...fetchOptions,
+        ...fetchOptions(),
     });
 
     if (!response.ok) {
@@ -243,7 +243,7 @@ export async function RenewFindMySession(
         headers: DEFAULT_HEADERS,
         method: 'POST',
         body: JSON.stringify(data),
-        ...fetchOptions,
+        ...fetchOptions(),
     });
 
     if (!response.ok) {
